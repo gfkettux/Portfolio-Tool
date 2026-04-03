@@ -1,0 +1,102 @@
+﻿Phase 1: Define the Exact MVP
+Before I write a single line of code, I must answer this clearly:
+What does Version 1 do and what does it not do?
+V1 should:
+* Accept ticker symbols and dollar amounts
+* Pull current price data
+* Calculate allocation percentages
+* Estimate volatility or beta
+* Classify sectors
+* Generate summary
+V1 should NOT (yet):
+* Store accounts
+* Save portfolios
+* Optimize allocations
+   * This is definitely something that could come in the future though
+* Suggest trades
+* Do advanced risk modeling
+* Handle options or derivatives
+Keep it simple or I will stall.
+Phase 2: Technical Foundations You Need
+You need to accomplish four technical competencies.
+1. Pull financial data from an API
+2. Perform portfolio math
+3. Call an AI API for explanation
+4. Deploy a simple web interface
+
+Phase 3: Concrete Step by Step Build Plan
+Step 1: Data Access
+Use a free API like:
+   * Alpha Vantage
+   * Yahoo Finance via yfinance Python library
+Goal:
+Given a ticker, pull:
+   * Current price
+   * Historical data
+   * Sector
+   * Beta if available
+Do this in pure Python first. No web app yet.
+Step 2: Portfolio Math Engine
+Ex.
+Given:
+AAPL 2000
+TSLA 1000
+SPY 3000
+Tool calculates:
+   * Total value
+   * Allocation percentages
+   * Weighted beta
+   * Basic volatility estimate from historical returns
+This is pure Python and pandas.
+This step is critical. This is where I actually become technically stronger.
+
+
+Step 3: AI Explanation Layer
+Once you have raw metrics, you send something like:
+Portfolio allocation:
+   * Tech 72 percent
+   * Energy 5 percent
+   * Beta 1.3
+   * Volatility above market average
+Then prompt the AI:
+Explain what this means in clear language for a retail investor. Avoid generic fluff. Be specific.
+   * This is where the product differentiates.
+   * If the explanation feels vague, users will leave. I have an opportunity to provide investors with nuanced opinions and clear, but detailed data
+Step 4: Build the Interface
+Streamlit?
+Simple layout:
+   * Title
+   * Input box for tickers and amounts
+   * Is there a better, more seamless way to import a portfolio
+   * Analyze button
+   * Results displayed below
+No styling obsession. Function first.
+   * I’m a big fan of a satisfying UI though, so eventually that will exist: Conveying advanced data in a simple, maybe satisfying way. That can come later though.
+
+
+Step 5: Deploy
+Streamlit, Cloud, or similar free host.
+You are not allowed to call it complete until:
+Someone else can use it without your help.
+
+
+Phase 4: Sharpen the Edge
+Once it works, improve one thing:
+Either
+Clarity of insights
+Or
+Better risk metrics
+Or
+Cleaner UX
+Or
+Any other detail, aspect, tool, improvement, etc that will improve my creation
+Not all at once though.
+**Important Reality Check
+This tool probably already exists in some form.
+Your edge is:
+Brutal simplicity
+No login
+Fast output
+Clear explanation
+You are not competing with Bloomberg.
+You are competing with confusion.
