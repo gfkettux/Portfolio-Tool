@@ -38,6 +38,7 @@ def is_etf(info):
 
 # --- Helper: fix dollar sign formatting from AI output ---
 def fix_dollar_formatting(text):
+    # Replace backtick-wrapped dollar amounts like `$1,770` with plain $1,770
     text = text.replace("`", "")
     return text
 
@@ -48,6 +49,7 @@ def check_data_freshness(history):
     last_date = history.index[-1].date()
     today = datetime.today().date()
     days_since = (today - last_date).days
+    # Allow up to 4 days (covers weekends + holidays)
     return days_since <= 4
 
 # --- Data fetch ---
@@ -61,6 +63,7 @@ def get_ticker_data(ticker):
         warnings = []
         ticker_is_etf = is_etf(info)
 
+        # Check data freshness
         if not check_data_freshness(history):
             warnings.append(ticker + ": price data may be stale — market could be closed or data delayed")
 
@@ -97,87 +100,11 @@ def get_ticker_data(ticker):
             "missing": missing,
             "warnings": warnings,
             "is_etf": ticker_is_etf,
-            "history": history,   # ← NEW: return full price history for return calculations
             "valid": True
         }
 
     except Exception as e:
         return {"ticker": ticker, "valid": False, "error": str(e)}
-
-
-# --- NEW: Fetch SPY benchmark data ---
-# Returns SPY's volatility, 1-year return, and daily close series.
-# If SPY is already in the portfolio, we reuse that history instead of fetching twice.
-def get_spy_benchmark(existing_histories=None):
-    try:
-        if existing_histories and "SPY" in existing_histories:
-            history = existing_histories["SPY"]
-        else:
-            spy = yf.Ticker("SPY")
-            history = spy.history(period="1y")
-
-        if len(history) < 2:
-            return None
-
-        daily_returns = history["Close"].pct_change().dropna()
-        spy_volatility = round(daily_returns.std() * (252 ** 0.5) * 100, 2)
-
-        start_price = history["Close"].iloc[0]
-        end_price = history["Close"].iloc[-1]
-        spy_return = round((end_price - start_price) / start_price * 100, 2)
-
-        return {
-            "volatility": spy_volatility,
-            "one_year_return": spy_return,
-            "beta": 1.0,   # SPY is the market — beta is always 1.0 by definition
-            "close_series": history["Close"]
-        }
-    except Exception:
-        return None
-
-
-# --- NEW: Calculate portfolio 1-year return ---
-# Builds a weighted daily portfolio value series from each holding's price history,
-# then computes the total return from start to end of that series.
-# Holdings missing a full year of history are excluded from this calculation.
-def get_portfolio_return(df, holdings, ticker_histories):
-    try:
-        # Align all price series to the same date index
-        close_frames = {}
-        for ticker in df["Ticker"]:
-            if ticker in ticker_histories and len(ticker_histories[ticker]) > 1:
-                close_frames[ticker] = ticker_histories[ticker]["Close"]
-
-        if not close_frames:
-            return None
-
-        price_df = pd.DataFrame(close_frames)
-        price_df = price_df.dropna()  # only keep dates where all included tickers have data
-
-        if len(price_df) < 2:
-            return None
-
-        total = df["Amount Invested"].sum()
-
-        # Build weighted portfolio value series
-        portfolio_series = pd.Series(0.0, index=price_df.index)
-        tickers_included = []
-        for ticker in close_frames:
-            amount = holdings.get(ticker, 0)
-            weight = amount / total
-            # Normalize each ticker's price to its starting value, then apply weight and amount
-            normalized = price_df[ticker] / price_df[ticker].iloc[0]
-            portfolio_series += normalized * amount
-            tickers_included.append(ticker)
-
-        start_val = portfolio_series.iloc[0]
-        end_val = portfolio_series.iloc[-1]
-        portfolio_return = round((end_val - start_val) / start_val * 100, 2)
-
-        return portfolio_return
-
-    except Exception:
-        return None
 
 
 # --- Portfolio analysis ---
@@ -186,7 +113,6 @@ def analyze_portfolio(holdings):
     missing_data_notes = []
     warnings = []
     skipped = []
-    ticker_histories = {}   # ← NEW: store each ticker's history for return calculations
 
     progress = st.progress(0, text="Fetching data...")
     tickers = list(holdings.keys())
@@ -207,9 +133,6 @@ def analyze_portfolio(holdings):
 
         if data["warnings"]:
             warnings.extend(data["warnings"])
-
-        # ← NEW: store this ticker's history keyed by ticker symbol
-        ticker_histories[ticker] = data["history"]
 
         rows.append({
             "Ticker": ticker,
@@ -243,22 +166,7 @@ def analyze_portfolio(holdings):
     sector_breakdown = df.groupby("Sector")["Allocation %"].sum().round(2).to_dict()
     concentrated_sectors = {s: p for s, p in sector_breakdown.items() if p > 60 and s not in ["ETF (diversified)", "Unknown"]}
 
-    # --- NEW: Fetch SPY benchmark (reuse history if SPY is already in portfolio) ---
-    spy_data = get_spy_benchmark(existing_histories=ticker_histories)
-
-    # --- NEW: Calculate portfolio 1-year return ---
-    portfolio_return = get_portfolio_return(df, holdings, ticker_histories)
-
-    # Build AI prompt — updated to include benchmark comparison data
-    benchmark_context = ""
-    if spy_data:
-        benchmark_context = (
-            "SPY Benchmark — Volatility: " + str(spy_data["volatility"]) + "%, "
-            "1-Year Return: " + str(spy_data["one_year_return"]) + "%. "
-        )
-    if portfolio_return is not None:
-        benchmark_context += "Portfolio 1-Year Return: " + str(portfolio_return) + "%. "
-
+    # Build AI prompt
     prompt = (
         "You are a financial analyst explaining a retail investor portfolio. "
         "Be specific, direct, and avoid generic advice. Use plain text only — no markdown, no bold, no bullet points. "
@@ -266,14 +174,13 @@ def analyze_portfolio(holdings):
         "Total Value: $" + "{:,.2f}".format(total) + ". "
         "Weighted Beta: " + str(weighted_beta) + ". "
         "Weighted Annualized Volatility: " + (str(weighted_volatility) + "%" if weighted_volatility else "unavailable") + ". "
-        + benchmark_context +
         "Sector Breakdown: " + str(sector_breakdown) + ". "
         "Holdings: " + str(df[["Ticker", "Allocation %", "Beta", "Volatility %", "Type"]].to_dict(orient="records")) + ". "
         "Missing data notes: " + (", ".join(missing_data_notes) if missing_data_notes else "none") + ". "
         "Explain in 4-5 sentences: "
         "1. What this portfolio is concentrated in and what that means. "
-        "2. What the beta and volatility tell us about risk level, and how that compares to SPY if benchmark data is available. "
-        "3. How the risk is distributed across holdings — which positions are driving it. "
+        "2. What the beta and volatility together tell us about the risk level. "
+        "3. How the risk is distributed across holdings - which positions are driving it. "
         "4. One specific thing this investor should be aware of or watch out for."
     )
 
@@ -300,9 +207,7 @@ def analyze_portfolio(holdings):
         "concentrated_sectors": concentrated_sectors,
         "skipped": skipped,
         "missing_data_notes": missing_data_notes,
-        "warnings": warnings,
-        "spy_data": spy_data,                   # ← NEW
-        "portfolio_return": portfolio_return     # ← NEW
+        "warnings": warnings
     }
     st.session_state.ai_analysis = ai_text
 
@@ -356,44 +261,6 @@ if st.session_state.results_ready:
     col1.metric("Total Value", "$" + "{:,.2f}".format(s["total"]))
     col2.metric("Weighted Beta", str(s["weighted_beta"]))
     col3.metric("Weighted Volatility", str(s["weighted_volatility"]) + "%" if s["weighted_volatility"] else "N/A")
-
-    # --- NEW: Benchmark Comparison Section ---
-    # Displays a side-by-side table comparing your portfolio metrics against SPY.
-    # Only shown if SPY data was successfully fetched.
-    spy = s.get("spy_data")
-    port_return = s.get("portfolio_return")
-
-    if spy:
-        st.subheader("Benchmark Comparison (vs. SPY)")
-
-        # Build comparison rows
-        comparison_rows = [
-            {
-                "Metric": "Beta",
-                "Your Portfolio": str(s["weighted_beta"]),
-                "SPY (Benchmark)": "1.00"
-            },
-            {
-                "Metric": "Annualized Volatility",
-                "Your Portfolio": str(s["weighted_volatility"]) + "%" if s["weighted_volatility"] else "N/A",
-                "SPY (Benchmark)": str(spy["volatility"]) + "%"
-            },
-            {
-                "Metric": "1-Year Return",
-                "Your Portfolio": (("+" if port_return >= 0 else "") + str(port_return) + "%") if port_return is not None else "N/A",
-                "SPY (Benchmark)": ("+" if spy["one_year_return"] >= 0 else "") + str(spy["one_year_return"]) + "%"
-            }
-        ]
-
-        comparison_df = pd.DataFrame(comparison_rows)
-        st.dataframe(comparison_df.set_index("Metric"), use_container_width=True)
-
-        st.caption(
-            "Beta measures sensitivity to market moves — SPY's beta is always 1.0 by definition. "
-            "Volatility is annualized from 1 year of daily returns. "
-            "1-Year Return is calculated from daily price history and may differ slightly from brokerage statements due to dividend handling."
-        )
-    # --- END NEW: Benchmark Comparison Section ---
 
     st.dataframe(
         df[["Ticker", "Type", "Amount Invested", "Allocation %", "Sector", "Beta", "Volatility %"]].reset_index(drop=True),
