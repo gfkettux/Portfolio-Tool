@@ -50,6 +50,16 @@ def check_data_freshness(history):
     days_since = (today - last_date).days
     return days_since <= 4
 
+# --- Helper: calculate max drawdown for a single price series ---
+# Takes a pandas Series of prices, returns the worst peak-to-trough drop as a percentage.
+def calc_max_drawdown(price_series):
+    if len(price_series) < 2:
+        return None
+    running_peak = price_series.cummax()
+    drawdown = (price_series - running_peak) / running_peak * 100
+    return round(drawdown.min(), 2)  # most negative value = worst drop
+
+
 # --- Data fetch ---
 def get_ticker_data(ticker):
     try:
@@ -88,12 +98,16 @@ def get_ticker_data(ticker):
             volatility = None
             missing.append("volatility")
 
+        # --- NEW: calculate max drawdown per ticker ---
+        max_drawdown = calc_max_drawdown(history["Close"]) if len(history) > 1 else None
+
         return {
             "ticker": ticker,
             "current_price": current_price,
             "sector": sector,
             "beta": beta,
             "volatility": volatility,
+            "max_drawdown": max_drawdown,   # ← NEW
             "missing": missing,
             "warnings": warnings,
             "is_etf": ticker_is_etf,
@@ -134,7 +148,9 @@ def get_spy_benchmark(existing_histories=None):
         return None
 
 
-# --- Calculate portfolio 1-year return ---
+# --- Calculate portfolio 1-year return and portfolio-level max drawdown ---
+# Builds a weighted daily portfolio value series, then computes both
+# total return and the worst peak-to-trough drop across that combined series.
 def get_portfolio_return(df, holdings, ticker_histories):
     try:
         close_frames = {}
@@ -143,13 +159,13 @@ def get_portfolio_return(df, holdings, ticker_histories):
                 close_frames[ticker] = ticker_histories[ticker]["Close"]
 
         if not close_frames:
-            return None
+            return None, None
 
         price_df = pd.DataFrame(close_frames)
         price_df = price_df.dropna()
 
         if len(price_df) < 2:
-            return None
+            return None, None
 
         total = df["Amount Invested"].sum()
 
@@ -163,10 +179,13 @@ def get_portfolio_return(df, holdings, ticker_histories):
         end_val = portfolio_series.iloc[-1]
         portfolio_return = round((end_val - start_val) / start_val * 100, 2)
 
-        return portfolio_return
+        # --- NEW: calculate portfolio-level max drawdown from the combined series ---
+        portfolio_max_drawdown = calc_max_drawdown(portfolio_series)
+
+        return portfolio_return, portfolio_max_drawdown
 
     except Exception:
-        return None
+        return None, None
 
 
 # --- Calculate correlation matrix ---
@@ -244,6 +263,7 @@ def analyze_portfolio(holdings):
             "Sector": data["sector"],
             "Beta": data["beta"],
             "Volatility %": data["volatility"],
+            "Max Drawdown %": data["max_drawdown"],   # ← NEW
             "Type": "ETF" if data["is_etf"] else "Stock"
         })
 
@@ -271,7 +291,10 @@ def analyze_portfolio(holdings):
     concentrated_sectors = {s: p for s, p in sector_breakdown.items() if p > 60 and s not in ["ETF (diversified)", "Unknown"]}
 
     spy_data = get_spy_benchmark(existing_histories=ticker_histories)
-    portfolio_return = get_portfolio_return(df, holdings, ticker_histories)
+
+    # --- UPDATED: get_portfolio_return now returns both return and drawdown ---
+    portfolio_return, portfolio_max_drawdown = get_portfolio_return(df, holdings, ticker_histories)
+
     corr_matrix, high_corr_pairs = get_correlation_matrix(ticker_histories)
 
     # Build correlation context for AI prompt
@@ -281,6 +304,18 @@ def analyze_portfolio(holdings):
         corr_context = "High correlation pairs (above 0.80): " + ", ".join(pair_strings) + ". "
     elif corr_matrix is not None:
         corr_context = "No holdings pairs have correlation above 0.80 — diversification across holdings is reasonable. "
+
+    # --- NEW: build drawdown context for AI prompt ---
+    drawdown_context = ""
+    if portfolio_max_drawdown is not None:
+        drawdown_context += "Portfolio max drawdown (worst peak-to-trough drop over past year): " + str(portfolio_max_drawdown) + "%. "
+    valid_dd = df.dropna(subset=["Max Drawdown %"])
+    if not valid_dd.empty:
+        worst_holding = valid_dd.loc[valid_dd["Max Drawdown %"].idxmin()]
+        drawdown_context += (
+            "Worst individual holding drawdown: " + worst_holding["Ticker"] +
+            " at " + str(worst_holding["Max Drawdown %"]) + "%. "
+        )
 
     benchmark_context = ""
     if spy_data:
@@ -299,14 +334,15 @@ def analyze_portfolio(holdings):
         "Weighted Beta: " + str(weighted_beta) + ". "
         "Weighted Annualized Volatility: " + (str(weighted_volatility) + "%" if weighted_volatility else "unavailable") + ". "
         + benchmark_context
-        + corr_context +
+        + corr_context
+        + drawdown_context +
         "Sector Breakdown: " + str(sector_breakdown) + ". "
-        "Holdings: " + str(df[["Ticker", "Allocation %", "Beta", "Volatility %", "Type"]].to_dict(orient="records")) + ". "
+        "Holdings: " + str(df[["Ticker", "Allocation %", "Beta", "Volatility %", "Max Drawdown %", "Type"]].to_dict(orient="records")) + ". "
         "Missing data notes: " + (", ".join(missing_data_notes) if missing_data_notes else "none") + ". "
         "Explain in 4-5 sentences: "
         "1. What this portfolio is concentrated in and what that means. "
-        "2. What the beta and volatility tell us about risk level, and how that compares to SPY if benchmark data is available. "
-        "3. How the risk is distributed across holdings — which positions are driving it, and whether high correlation between holdings creates hidden concentration risk. "
+        "2. What the beta, volatility, and max drawdown together tell us about the real downside risk, compared to SPY where available. "
+        "3. How the risk is distributed across holdings — which positions are driving it, and whether high correlation creates hidden concentration risk. "
         "4. One specific thing this investor should be aware of or watch out for."
     )
 
@@ -335,6 +371,7 @@ def analyze_portfolio(holdings):
         "warnings": warnings,
         "spy_data": spy_data,
         "portfolio_return": portfolio_return,
+        "portfolio_max_drawdown": portfolio_max_drawdown,   # ← NEW
         "corr_matrix": corr_matrix,
         "high_corr_pairs": high_corr_pairs
     }
@@ -385,11 +422,17 @@ if st.session_state.results_ready:
     df = st.session_state.df
     s = st.session_state.summary
 
-    st.subheader("Portfolio Breakdown")
-    col1, col2, col3 = st.columns(3)
+    # --- Summary Metrics ---
+    # NEW: now four columns — added Portfolio Max Drawdown
+    st.subheader("Portfolio Summary")
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Total Value", "$" + "{:,.2f}".format(s["total"]))
     col2.metric("Weighted Beta", str(s["weighted_beta"]))
     col3.metric("Weighted Volatility", str(s["weighted_volatility"]) + "%" if s["weighted_volatility"] else "N/A")
+    col4.metric(
+        "Max Drawdown",
+        str(s["portfolio_max_drawdown"]) + "%" if s["portfolio_max_drawdown"] is not None else "N/A"
+    )
 
     # --- Benchmark Comparison ---
     spy = s.get("spy_data")
@@ -425,7 +468,6 @@ if st.session_state.results_ready:
     if corr_matrix is not None:
         st.subheader("Correlation Matrix")
 
-        # Color each cell based on its correlation value
         def color_correlation(val):
             if val == 1.0:
                 return "background-color: #c0392b; color: white;"
@@ -440,7 +482,6 @@ if st.session_state.results_ready:
             else:
                 return "background-color: #27ae60; color: white;"
 
-        # .map() replaces the deprecated .applymap() in newer pandas versions
         styled_corr = corr_matrix.style.map(color_correlation).format("{:.2f}")
         st.dataframe(styled_corr, width='stretch')
 
@@ -460,8 +501,10 @@ if st.session_state.results_ready:
                 )
 
     # --- Portfolio Table ---
+    # NEW: Max Drawdown % column added
+    st.subheader("Portfolio Breakdown")
     st.dataframe(
-        df[["Ticker", "Type", "Amount Invested", "Allocation %", "Sector", "Beta", "Volatility %"]].reset_index(drop=True),
+        df[["Ticker", "Type", "Amount Invested", "Allocation %", "Sector", "Beta", "Volatility %", "Max Drawdown %"]].reset_index(drop=True),
         width='stretch'
     )
 
