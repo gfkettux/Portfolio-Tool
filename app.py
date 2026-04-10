@@ -97,7 +97,7 @@ def get_ticker_data(ticker):
             "missing": missing,
             "warnings": warnings,
             "is_etf": ticker_is_etf,
-            "history": history,   # ← NEW: return full price history for return calculations
+            "history": history,
             "valid": True
         }
 
@@ -105,9 +105,7 @@ def get_ticker_data(ticker):
         return {"ticker": ticker, "valid": False, "error": str(e)}
 
 
-# --- NEW: Fetch SPY benchmark data ---
-# Returns SPY's volatility, 1-year return, and daily close series.
-# If SPY is already in the portfolio, we reuse that history instead of fetching twice.
+# --- Fetch SPY benchmark data ---
 def get_spy_benchmark(existing_histories=None):
     try:
         if existing_histories and "SPY" in existing_histories:
@@ -129,20 +127,16 @@ def get_spy_benchmark(existing_histories=None):
         return {
             "volatility": spy_volatility,
             "one_year_return": spy_return,
-            "beta": 1.0,   # SPY is the market — beta is always 1.0 by definition
+            "beta": 1.0,
             "close_series": history["Close"]
         }
     except Exception:
         return None
 
 
-# --- NEW: Calculate portfolio 1-year return ---
-# Builds a weighted daily portfolio value series from each holding's price history,
-# then computes the total return from start to end of that series.
-# Holdings missing a full year of history are excluded from this calculation.
+# --- Calculate portfolio 1-year return ---
 def get_portfolio_return(df, holdings, ticker_histories):
     try:
-        # Align all price series to the same date index
         close_frames = {}
         for ticker in df["Ticker"]:
             if ticker in ticker_histories and len(ticker_histories[ticker]) > 1:
@@ -152,23 +146,18 @@ def get_portfolio_return(df, holdings, ticker_histories):
             return None
 
         price_df = pd.DataFrame(close_frames)
-        price_df = price_df.dropna()  # only keep dates where all included tickers have data
+        price_df = price_df.dropna()
 
         if len(price_df) < 2:
             return None
 
         total = df["Amount Invested"].sum()
 
-        # Build weighted portfolio value series
         portfolio_series = pd.Series(0.0, index=price_df.index)
-        tickers_included = []
         for ticker in close_frames:
             amount = holdings.get(ticker, 0)
-            weight = amount / total
-            # Normalize each ticker's price to its starting value, then apply weight and amount
             normalized = price_df[ticker] / price_df[ticker].iloc[0]
             portfolio_series += normalized * amount
-            tickers_included.append(ticker)
 
         start_val = portfolio_series.iloc[0]
         end_val = portfolio_series.iloc[-1]
@@ -180,13 +169,52 @@ def get_portfolio_return(df, holdings, ticker_histories):
         return None
 
 
+# --- Calculate correlation matrix ---
+def get_correlation_matrix(ticker_histories):
+    try:
+        returns_frames = {}
+        for ticker, history in ticker_histories.items():
+            if len(history) > 1:
+                daily_returns = history["Close"].pct_change().dropna()
+                returns_frames[ticker] = daily_returns
+
+        if len(returns_frames) < 2:
+            return None, []
+
+        returns_df = pd.DataFrame(returns_frames)
+        returns_df = returns_df.dropna()
+
+        if len(returns_df) < 20:
+            return None, []
+
+        corr_matrix = returns_df.corr().round(2)
+
+        high_corr_pairs = []
+        tickers = corr_matrix.columns.tolist()
+        for i in range(len(tickers)):
+            for j in range(i + 1, len(tickers)):
+                val = corr_matrix.iloc[i, j]
+                if val >= 0.8:
+                    high_corr_pairs.append({
+                        "pair": tickers[i] + " & " + tickers[j],
+                        "correlation": val
+                    })
+
+        high_corr_pairs.sort(key=lambda x: x["correlation"], reverse=True)
+
+        return corr_matrix, high_corr_pairs
+
+    except Exception:
+        return None, []
+
+
 # --- Portfolio analysis ---
 def analyze_portfolio(holdings):
     rows = []
     missing_data_notes = []
     warnings = []
     skipped = []
-    ticker_histories = {}   # ← NEW: store each ticker's history for return calculations
+    ticker_histories = {}
 
     progress = st.progress(0, text="Fetching data...")
     tickers = list(holdings.keys())
@@ -208,7 +236,6 @@ def analyze_portfolio(holdings):
         if data["warnings"]:
             warnings.extend(data["warnings"])
 
-        # ← NEW: store this ticker's history keyed by ticker symbol
         ticker_histories[ticker] = data["history"]
 
         rows.append({
@@ -243,13 +270,18 @@ def analyze_portfolio(holdings):
     sector_breakdown = df.groupby("Sector")["Allocation %"].sum().round(2).to_dict()
     concentrated_sectors = {s: p for s, p in sector_breakdown.items() if p > 60 and s not in ["ETF (diversified)", "Unknown"]}
 
-    # --- NEW: Fetch SPY benchmark (reuse history if SPY is already in portfolio) ---
     spy_data = get_spy_benchmark(existing_histories=ticker_histories)
-
-    # --- NEW: Calculate portfolio 1-year return ---
     portfolio_return = get_portfolio_return(df, holdings, ticker_histories)
+    corr_matrix, high_corr_pairs = get_correlation_matrix(ticker_histories)
 
-    # Build AI prompt — updated to include benchmark comparison data
+    # Build correlation context for AI prompt
+    corr_context = ""
+    if high_corr_pairs:
+        pair_strings = [p["pair"] + " (" + str(p["correlation"]) + ")" for p in high_corr_pairs]
+        corr_context = "High correlation pairs (above 0.80): " + ", ".join(pair_strings) + ". "
+    elif corr_matrix is not None:
+        corr_context = "No holdings pairs have correlation above 0.80 — diversification across holdings is reasonable. "
+
     benchmark_context = ""
     if spy_data:
         benchmark_context = (
@@ -266,14 +298,15 @@ def analyze_portfolio(holdings):
         "Total Value: $" + "{:,.2f}".format(total) + ". "
         "Weighted Beta: " + str(weighted_beta) + ". "
         "Weighted Annualized Volatility: " + (str(weighted_volatility) + "%" if weighted_volatility else "unavailable") + ". "
-        + benchmark_context +
+        + benchmark_context
+        + corr_context +
         "Sector Breakdown: " + str(sector_breakdown) + ". "
         "Holdings: " + str(df[["Ticker", "Allocation %", "Beta", "Volatility %", "Type"]].to_dict(orient="records")) + ". "
         "Missing data notes: " + (", ".join(missing_data_notes) if missing_data_notes else "none") + ". "
         "Explain in 4-5 sentences: "
         "1. What this portfolio is concentrated in and what that means. "
         "2. What the beta and volatility tell us about risk level, and how that compares to SPY if benchmark data is available. "
-        "3. How the risk is distributed across holdings — which positions are driving it. "
+        "3. How the risk is distributed across holdings — which positions are driving it, and whether high correlation between holdings creates hidden concentration risk. "
         "4. One specific thing this investor should be aware of or watch out for."
     )
 
@@ -289,7 +322,6 @@ def analyze_portfolio(holdings):
         except Exception as e:
             ai_text = "AI analysis failed: " + str(e)
 
-    # Store in session state
     st.session_state.results_ready = True
     st.session_state.df = df
     st.session_state.summary = {
@@ -301,8 +333,10 @@ def analyze_portfolio(holdings):
         "skipped": skipped,
         "missing_data_notes": missing_data_notes,
         "warnings": warnings,
-        "spy_data": spy_data,                   # ← NEW
-        "portfolio_return": portfolio_return     # ← NEW
+        "spy_data": spy_data,
+        "portfolio_return": portfolio_return,
+        "corr_matrix": corr_matrix,
+        "high_corr_pairs": high_corr_pairs
     }
     st.session_state.ai_analysis = ai_text
 
@@ -346,7 +380,7 @@ if st.button("Analyze Portfolio"):
     else:
         analyze_portfolio(holdings)
 
-# --- Display Results (persists via session state) ---
+# --- Display Results ---
 if st.session_state.results_ready:
     df = st.session_state.df
     s = st.session_state.summary
@@ -357,22 +391,14 @@ if st.session_state.results_ready:
     col2.metric("Weighted Beta", str(s["weighted_beta"]))
     col3.metric("Weighted Volatility", str(s["weighted_volatility"]) + "%" if s["weighted_volatility"] else "N/A")
 
-    # --- NEW: Benchmark Comparison Section ---
-    # Displays a side-by-side table comparing your portfolio metrics against SPY.
-    # Only shown if SPY data was successfully fetched.
+    # --- Benchmark Comparison ---
     spy = s.get("spy_data")
     port_return = s.get("portfolio_return")
 
     if spy:
         st.subheader("Benchmark Comparison (vs. SPY)")
-
-        # Build comparison rows
         comparison_rows = [
-            {
-                "Metric": "Beta",
-                "Your Portfolio": str(s["weighted_beta"]),
-                "SPY (Benchmark)": "1.00"
-            },
+            {"Metric": "Beta", "Your Portfolio": str(s["weighted_beta"]), "SPY (Benchmark)": "1.00"},
             {
                 "Metric": "Annualized Volatility",
                 "Your Portfolio": str(s["weighted_volatility"]) + "%" if s["weighted_volatility"] else "N/A",
@@ -384,25 +410,65 @@ if st.session_state.results_ready:
                 "SPY (Benchmark)": ("+" if spy["one_year_return"] >= 0 else "") + str(spy["one_year_return"]) + "%"
             }
         ]
-
         comparison_df = pd.DataFrame(comparison_rows)
-        st.dataframe(comparison_df.set_index("Metric"), use_container_width=True)
-
+        st.dataframe(comparison_df.set_index("Metric"), width='stretch')
         st.caption(
             "Beta measures sensitivity to market moves — SPY's beta is always 1.0 by definition. "
             "Volatility is annualized from 1 year of daily returns. "
             "1-Year Return is calculated from daily price history and may differ slightly from brokerage statements due to dividend handling."
         )
-    # --- END NEW: Benchmark Comparison Section ---
 
+    # --- Correlation Matrix ---
+    corr_matrix = s.get("corr_matrix")
+    high_corr_pairs = s.get("high_corr_pairs", [])
+
+    if corr_matrix is not None:
+        st.subheader("Correlation Matrix")
+
+        # Color each cell based on its correlation value
+        def color_correlation(val):
+            if val == 1.0:
+                return "background-color: #c0392b; color: white;"
+            elif val >= 0.8:
+                return "background-color: #e74c3c; color: white;"
+            elif val >= 0.6:
+                return "background-color: #e67e22; color: white;"
+            elif val >= 0.4:
+                return "background-color: #f39c12; color: black;"
+            elif val >= 0.2:
+                return "background-color: #d4efdf; color: black;"
+            else:
+                return "background-color: #27ae60; color: white;"
+
+        # .map() replaces the deprecated .applymap() in newer pandas versions
+        styled_corr = corr_matrix.style.map(color_correlation).format("{:.2f}")
+        st.dataframe(styled_corr, width='stretch')
+
+        st.caption(
+            "Correlation ranges from -1.0 to 1.0. "
+            "1.0 means two holdings move in perfect lockstep. "
+            "0.0 means no relationship. "
+            "Negative values mean they tend to move in opposite directions. "
+            "Pairs above 0.80 are highlighted in red — they may look diversified but behave as one position in a downturn."
+        )
+
+        if high_corr_pairs:
+            for pair in high_corr_pairs:
+                st.warning(
+                    "High Correlation: " + pair["pair"] + " have a correlation of " +
+                    str(pair["correlation"]) + " — these holdings tend to move together and may not provide the diversification they appear to."
+                )
+
+    # --- Portfolio Table ---
     st.dataframe(
         df[["Ticker", "Type", "Amount Invested", "Allocation %", "Sector", "Beta", "Volatility %"]].reset_index(drop=True),
-        use_container_width=True
+        width='stretch'
     )
 
+    # --- Sector Breakdown ---
     st.subheader("Sector Breakdown")
     sector_df = pd.DataFrame(list(s["sector_breakdown"].items()), columns=["Sector", "Allocation %"])
-    st.dataframe(sector_df, use_container_width=True)
+    st.dataframe(sector_df, width='stretch')
 
     if s["concentrated_sectors"]:
         for sector, pct in s["concentrated_sectors"].items():
