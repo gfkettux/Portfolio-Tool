@@ -17,6 +17,13 @@ except Exception:
     st.error("API key not found. Please add it to your .streamlit/secrets.toml file.")
     st.stop()
 
+# --- Risk-free rate fallback ---
+# Used in Sharpe ratio calculation. We attempt to fetch the live 13-week
+# T-bill yield from Yahoo Finance (^IRX). If that fails for any reason,
+# we fall back to this hardcoded value. Update this occasionally if the
+# Fed makes major rate changes and live fetching is broken.
+RISK_FREE_RATE_FALLBACK = 4.3  # percent, annualized
+
 # --- Session state initialization ---
 if "results_ready" not in st.session_state:
     st.session_state.results_ready = False
@@ -51,13 +58,28 @@ def check_data_freshness(history):
     return days_since <= 4
 
 # --- Helper: calculate max drawdown for a single price series ---
-# Takes a pandas Series of prices, returns the worst peak-to-trough drop as a percentage.
 def calc_max_drawdown(price_series):
     if len(price_series) < 2:
         return None
     running_peak = price_series.cummax()
     drawdown = (price_series - running_peak) / running_peak * 100
-    return round(drawdown.min(), 2)  # most negative value = worst drop
+    return round(drawdown.min(), 2)
+
+# --- NEW: Fetch live risk-free rate from Yahoo Finance ---
+# Pulls the 13-week T-bill yield (^IRX), which is the standard proxy
+# for the risk-free rate used in Sharpe ratio calculations.
+# Falls back to RISK_FREE_RATE_FALLBACK if the fetch fails.
+def get_risk_free_rate():
+    try:
+        irx = yf.Ticker("^IRX")
+        hist = irx.history(period="5d")
+        if not hist.empty:
+            rate = round(hist["Close"].iloc[-1], 2)
+            if rate > 0:
+                return rate
+        return RISK_FREE_RATE_FALLBACK
+    except Exception:
+        return RISK_FREE_RATE_FALLBACK
 
 
 # --- Data fetch ---
@@ -98,7 +120,6 @@ def get_ticker_data(ticker):
             volatility = None
             missing.append("volatility")
 
-        # --- NEW: calculate max drawdown per ticker ---
         max_drawdown = calc_max_drawdown(history["Close"]) if len(history) > 1 else None
 
         return {
@@ -107,7 +128,7 @@ def get_ticker_data(ticker):
             "sector": sector,
             "beta": beta,
             "volatility": volatility,
-            "max_drawdown": max_drawdown,   # ← NEW
+            "max_drawdown": max_drawdown,
             "missing": missing,
             "warnings": warnings,
             "is_etf": ticker_is_etf,
@@ -148,10 +169,12 @@ def get_spy_benchmark(existing_histories=None):
         return None
 
 
-# --- Calculate portfolio 1-year return and portfolio-level max drawdown ---
-# Builds a weighted daily portfolio value series, then computes both
-# total return and the worst peak-to-trough drop across that combined series.
-def get_portfolio_return(df, holdings, ticker_histories):
+# --- Calculate portfolio return, max drawdown, and Sharpe ratio ---
+# Builds a weighted daily portfolio value series, then computes:
+# 1. Total 1-year return
+# 2. Worst peak-to-trough drawdown
+# 3. Sharpe ratio: (portfolio_return - risk_free_rate) / portfolio_volatility
+def get_portfolio_stats(df, holdings, ticker_histories, weighted_volatility, risk_free_rate):
     try:
         close_frames = {}
         for ticker in df["Ticker"]:
@@ -159,13 +182,13 @@ def get_portfolio_return(df, holdings, ticker_histories):
                 close_frames[ticker] = ticker_histories[ticker]["Close"]
 
         if not close_frames:
-            return None, None
+            return None, None, None
 
         price_df = pd.DataFrame(close_frames)
         price_df = price_df.dropna()
 
         if len(price_df) < 2:
-            return None, None
+            return None, None, None
 
         total = df["Amount Invested"].sum()
 
@@ -179,13 +202,19 @@ def get_portfolio_return(df, holdings, ticker_histories):
         end_val = portfolio_series.iloc[-1]
         portfolio_return = round((end_val - start_val) / start_val * 100, 2)
 
-        # --- NEW: calculate portfolio-level max drawdown from the combined series ---
         portfolio_max_drawdown = calc_max_drawdown(portfolio_series)
 
-        return portfolio_return, portfolio_max_drawdown
+        # --- NEW: Sharpe ratio ---
+        # Formula: (portfolio_return - risk_free_rate) / portfolio_volatility
+        # Both return and volatility are in percent, so units cancel cleanly.
+        sharpe_ratio = None
+        if weighted_volatility and weighted_volatility > 0:
+            sharpe_ratio = round((portfolio_return - risk_free_rate) / weighted_volatility, 2)
+
+        return portfolio_return, portfolio_max_drawdown, sharpe_ratio
 
     except Exception:
-        return None, None
+        return None, None, None
 
 
 # --- Calculate correlation matrix ---
@@ -263,7 +292,7 @@ def analyze_portfolio(holdings):
             "Sector": data["sector"],
             "Beta": data["beta"],
             "Volatility %": data["volatility"],
-            "Max Drawdown %": data["max_drawdown"],   # ← NEW
+            "Max Drawdown %": data["max_drawdown"],
             "Type": "ETF" if data["is_etf"] else "Stock"
         })
 
@@ -292,12 +321,24 @@ def analyze_portfolio(holdings):
 
     spy_data = get_spy_benchmark(existing_histories=ticker_histories)
 
-    # --- UPDATED: get_portfolio_return now returns both return and drawdown ---
-    portfolio_return, portfolio_max_drawdown = get_portfolio_return(df, holdings, ticker_histories)
+    # --- NEW: fetch live risk-free rate ---
+    risk_free_rate = get_risk_free_rate()
+
+    # --- UPDATED: get_portfolio_stats now returns return, drawdown, and Sharpe ---
+    portfolio_return, portfolio_max_drawdown, sharpe_ratio = get_portfolio_stats(
+        df, holdings, ticker_histories, weighted_volatility, risk_free_rate
+    )
+
+    # --- NEW: calculate SPY Sharpe ratio for benchmark comparison ---
+    spy_sharpe = None
+    if spy_data and spy_data["volatility"] and spy_data["volatility"] > 0:
+        spy_sharpe = round(
+            (spy_data["one_year_return"] - risk_free_rate) / spy_data["volatility"], 2
+        )
 
     corr_matrix, high_corr_pairs = get_correlation_matrix(ticker_histories)
 
-    # Build correlation context for AI prompt
+    # Build context strings for AI prompt
     corr_context = ""
     if high_corr_pairs:
         pair_strings = [p["pair"] + " (" + str(p["correlation"]) + ")" for p in high_corr_pairs]
@@ -305,7 +346,6 @@ def analyze_portfolio(holdings):
     elif corr_matrix is not None:
         corr_context = "No holdings pairs have correlation above 0.80 — diversification across holdings is reasonable. "
 
-    # --- NEW: build drawdown context for AI prompt ---
     drawdown_context = ""
     if portfolio_max_drawdown is not None:
         drawdown_context += "Portfolio max drawdown (worst peak-to-trough drop over past year): " + str(portfolio_max_drawdown) + "%. "
@@ -316,6 +356,15 @@ def analyze_portfolio(holdings):
             "Worst individual holding drawdown: " + worst_holding["Ticker"] +
             " at " + str(worst_holding["Max Drawdown %"]) + "%. "
         )
+
+    sharpe_context = ""
+    if sharpe_ratio is not None:
+        sharpe_context = (
+            "Portfolio Sharpe Ratio: " + str(sharpe_ratio) +
+            " (risk-free rate used: " + str(risk_free_rate) + "%). "
+        )
+        if spy_sharpe is not None:
+            sharpe_context += "SPY Sharpe Ratio: " + str(spy_sharpe) + ". "
 
     benchmark_context = ""
     if spy_data:
@@ -335,13 +384,14 @@ def analyze_portfolio(holdings):
         "Weighted Annualized Volatility: " + (str(weighted_volatility) + "%" if weighted_volatility else "unavailable") + ". "
         + benchmark_context
         + corr_context
-        + drawdown_context +
+        + drawdown_context
+        + sharpe_context +
         "Sector Breakdown: " + str(sector_breakdown) + ". "
         "Holdings: " + str(df[["Ticker", "Allocation %", "Beta", "Volatility %", "Max Drawdown %", "Type"]].to_dict(orient="records")) + ". "
         "Missing data notes: " + (", ".join(missing_data_notes) if missing_data_notes else "none") + ". "
         "Explain in 4-5 sentences: "
         "1. What this portfolio is concentrated in and what that means. "
-        "2. What the beta, volatility, and max drawdown together tell us about the real downside risk, compared to SPY where available. "
+        "2. What the beta, volatility, max drawdown, and Sharpe ratio together tell us about whether the returns justify the risk taken, compared to SPY where available. "
         "3. How the risk is distributed across holdings — which positions are driving it, and whether high correlation creates hidden concentration risk. "
         "4. One specific thing this investor should be aware of or watch out for."
     )
@@ -371,7 +421,10 @@ def analyze_portfolio(holdings):
         "warnings": warnings,
         "spy_data": spy_data,
         "portfolio_return": portfolio_return,
-        "portfolio_max_drawdown": portfolio_max_drawdown,   # ← NEW
+        "portfolio_max_drawdown": portfolio_max_drawdown,
+        "sharpe_ratio": sharpe_ratio,       # ← NEW
+        "spy_sharpe": spy_sharpe,           # ← NEW
+        "risk_free_rate": risk_free_rate,   # ← NEW
         "corr_matrix": corr_matrix,
         "high_corr_pairs": high_corr_pairs
     }
@@ -422,10 +475,9 @@ if st.session_state.results_ready:
     df = st.session_state.df
     s = st.session_state.summary
 
-    # --- Summary Metrics ---
-    # NEW: now four columns — added Portfolio Max Drawdown
+    # --- Summary Metrics: five columns ---
     st.subheader("Portfolio Summary")
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Total Value", "$" + "{:,.2f}".format(s["total"]))
     col2.metric("Weighted Beta", str(s["weighted_beta"]))
     col3.metric("Weighted Volatility", str(s["weighted_volatility"]) + "%" if s["weighted_volatility"] else "N/A")
@@ -433,15 +485,25 @@ if st.session_state.results_ready:
         "Max Drawdown",
         str(s["portfolio_max_drawdown"]) + "%" if s["portfolio_max_drawdown"] is not None else "N/A"
     )
+    col5.metric(
+        "Sharpe Ratio",
+        str(s["sharpe_ratio"]) if s["sharpe_ratio"] is not None else "N/A"
+    )
 
     # --- Benchmark Comparison ---
     spy = s.get("spy_data")
     port_return = s.get("portfolio_return")
+    spy_sharpe = s.get("spy_sharpe")
+    risk_free_rate = s.get("risk_free_rate", RISK_FREE_RATE_FALLBACK)
 
     if spy:
         st.subheader("Benchmark Comparison (vs. SPY)")
         comparison_rows = [
-            {"Metric": "Beta", "Your Portfolio": str(s["weighted_beta"]), "SPY (Benchmark)": "1.00"},
+            {
+                "Metric": "Beta",
+                "Your Portfolio": str(s["weighted_beta"]),
+                "SPY (Benchmark)": "1.00"
+            },
             {
                 "Metric": "Annualized Volatility",
                 "Your Portfolio": str(s["weighted_volatility"]) + "%" if s["weighted_volatility"] else "N/A",
@@ -451,6 +513,11 @@ if st.session_state.results_ready:
                 "Metric": "1-Year Return",
                 "Your Portfolio": (("+" if port_return >= 0 else "") + str(port_return) + "%") if port_return is not None else "N/A",
                 "SPY (Benchmark)": ("+" if spy["one_year_return"] >= 0 else "") + str(spy["one_year_return"]) + "%"
+            },
+            {
+                "Metric": "Sharpe Ratio",
+                "Your Portfolio": str(s["sharpe_ratio"]) if s["sharpe_ratio"] is not None else "N/A",
+                "SPY (Benchmark)": str(spy_sharpe) if spy_sharpe is not None else "N/A"
             }
         ]
         comparison_df = pd.DataFrame(comparison_rows)
@@ -458,7 +525,10 @@ if st.session_state.results_ready:
         st.caption(
             "Beta measures sensitivity to market moves — SPY's beta is always 1.0 by definition. "
             "Volatility is annualized from 1 year of daily returns. "
-            "1-Year Return is calculated from daily price history and may differ slightly from brokerage statements due to dividend handling."
+            "1-Year Return is calculated from daily price history and may differ slightly from brokerage statements due to dividend handling. "
+            "Sharpe Ratio = (Return - Risk-Free Rate) / Volatility. "
+            "Risk-free rate used: " + str(risk_free_rate) + "% (live 13-week T-bill yield). "
+            "A Sharpe Ratio above 1.0 is generally considered good. Above 2.0 is strong."
         )
 
     # --- Correlation Matrix ---
@@ -501,7 +571,6 @@ if st.session_state.results_ready:
                 )
 
     # --- Portfolio Table ---
-    # NEW: Max Drawdown % column added
     st.subheader("Portfolio Breakdown")
     st.dataframe(
         df[["Ticker", "Type", "Amount Invested", "Allocation %", "Sector", "Beta", "Volatility %", "Max Drawdown %"]].reset_index(drop=True),
