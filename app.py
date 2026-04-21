@@ -1,602 +1,859 @@
+"""
+app.py — Portfolio Insight Tool
+UI layer only. All data fetching lives in data.py, math in analysis.py,
+AI calls inline here, portfolio persistence in storage.py.
+"""
+
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import anthropic
+import io
 import re
-from datetime import datetime, timedelta
+import json
+from datetime import datetime
+
+from data import (
+    get_ticker_data,
+    get_spy_benchmark,
+    get_risk_free_rate,
+    RISK_FREE_RATE_FALLBACK,
+)
+from analysis import (
+    compute_portfolio_stats,
+    compute_correlation_matrix,
+    compute_weighted_beta,
+    compute_weighted_volatility,
+    build_portfolio_context,
+)
+from storage import (
+    list_portfolios,
+    save_portfolio,
+    load_portfolio,
+    delete_portfolio,
+)
 
 st.set_page_config(page_title="Portfolio Insight Tool", layout="centered")
-st.title("Portfolio Insight Tool")
-st.write("Enter your holdings below to get a full portfolio analysis.")
 
-# --- Load API key from Streamlit secrets ---
+# ============================================================
+# DESIGN SYSTEM
+# ============================================================
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=DM+Mono:wght@300;400;500&display=swap');
+
+html, body, [class*="css"], .stApp {
+    font-family: 'DM Sans', sans-serif !important;
+    background-color: #f5f5f5 !important;
+    color: #111111;
+}
+#MainMenu, footer, header { visibility: hidden; }
+.block-container { max-width: 900px; padding: 0 1.5rem 4rem 1.5rem !important; }
+
+/* HEADER */
+.pit-header { padding: 2.5rem 0 1.5rem 0; border-bottom: 1px solid #e5e7eb; }
+.pit-header-title { font-size: 1.5rem; font-weight: 600; color: #111111; letter-spacing: -0.02em; margin: 0 0 0.2rem 0; }
+.pit-header-sub { font-size: 0.875rem; color: #6b7280; font-weight: 400; margin: 0; }
+
+/* METRICS BAR */
+.pit-metrics-bar { background:#fff; border-bottom:1px solid #e5e7eb; padding:1rem 0; display:flex; }
+.pit-metric-item { flex:1; padding:0 1.25rem; border-right:1px solid #e5e7eb; }
+.pit-metric-item:first-child { padding-left:0; }
+.pit-metric-item:last-child { border-right:none; }
+.pit-metric-label { font-size:0.65rem; font-weight:600; text-transform:uppercase; letter-spacing:0.08em; color:#9ca3af; margin-bottom:0.3rem; }
+.pit-metric-value { font-family:'DM Mono',monospace; font-size:1.2rem; font-weight:500; color:#111111; line-height:1; }
+.pit-metric-value.pos { color:#16a34a; }
+.pit-metric-value.neg { color:#dc2626; }
+.pit-metric-value.warn { color:#dc2626; }
+.pit-metric-value.good { color:#16a34a; }
+
+/* SECTION LABEL */
+.pit-label { font-size:0.65rem; font-weight:600; text-transform:uppercase; letter-spacing:0.1em; color:#9ca3af; margin:0 0 1rem 0; padding-left:0.7rem; border-left:2px solid #2563eb; }
+
+/* SURFACE */
+.pit-surface { background:#fff; border:0.5px solid #e5e7eb; border-radius:8px; padding:1.5rem; margin-bottom:1rem; }
+
+/* INPUT HINT */
+.pit-input-hint { font-size:0.8rem; color:#6b7280; margin-bottom:0.75rem; }
+
+/* HOLDINGS TABLE */
+.h-table { width:100%; border-collapse:collapse; font-size:0.85rem; }
+.h-table th { font-size:0.62rem; font-weight:600; text-transform:uppercase; letter-spacing:0.08em; color:#9ca3af; padding:0.4rem 0.75rem; text-align:left; border-bottom:1px solid #e5e7eb; }
+.h-table th.r { text-align:right; }
+.h-table td { padding:0.65rem 0.75rem; border-bottom:0.5px solid #f3f4f6; color:#111111; vertical-align:middle; }
+.h-table td.r { text-align:right; font-family:'DM Mono',monospace; font-size:0.82rem; }
+.h-table tr:last-child td { border-bottom:none; }
+.h-table .tk { font-weight:600; letter-spacing:0.03em; font-size:0.875rem; }
+.h-table .badge { display:inline-block; font-size:0.6rem; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; padding:0.1rem 0.4rem; border-radius:4px; background:#f3f4f6; color:#6b7280; }
+.h-table .badge.etf { background:#eff6ff; color:#2563eb; }
+.h-table .neg { color:#dc2626; }
+.h-table .pos { color:#16a34a; }
+
+/* BENCHMARK TABLE */
+.b-table { width:100%; border-collapse:collapse; font-size:0.875rem; }
+.b-table th { font-size:0.62rem; font-weight:600; text-transform:uppercase; letter-spacing:0.08em; color:#9ca3af; padding:0.4rem 0.75rem; border-bottom:1px solid #e5e7eb; text-align:left; }
+.b-table th:not(:first-child) { text-align:right; }
+.b-table td { padding:0.7rem 0.75rem; border-bottom:0.5px solid #f3f4f6; color:#111111; }
+.b-table td:not(:first-child) { text-align:right; font-family:'DM Mono',monospace; font-size:0.85rem; }
+.b-table tr:last-child td { border-bottom:none; }
+.b-table .row-label { color:#374151; font-weight:500; font-size:0.85rem; }
+.b-table .pos { color:#16a34a; }
+.b-table .neg { color:#dc2626; }
+
+/* CORRELATION TABLE */
+.c-table { border-collapse:collapse; font-family:'DM Mono',monospace; font-size:0.82rem; }
+.c-table th { font-size:0.62rem; font-weight:600; text-transform:uppercase; letter-spacing:0.08em; color:#9ca3af; padding:0.4rem 0.75rem; text-align:center; border-bottom:1px solid #e5e7eb; }
+.c-table th:first-child { text-align:left; }
+.c-table td { padding:0.5rem 0.75rem; text-align:center; font-weight:500; border-bottom:0.5px solid #f3f4f6; min-width:60px; }
+.c-table td:first-child { text-align:left; font-family:'DM Sans',sans-serif; font-size:0.75rem; font-weight:600; color:#374151; text-transform:uppercase; letter-spacing:0.04em; min-width:60px; }
+.c-table tr:last-child td { border-bottom:none; }
+
+/* SECTOR TABLE */
+.s-table { width:100%; border-collapse:collapse; font-size:0.875rem; }
+.s-table th { font-size:0.62rem; font-weight:600; text-transform:uppercase; letter-spacing:0.08em; color:#9ca3af; padding:0.4rem 0.75rem; border-bottom:1px solid #e5e7eb; text-align:left; }
+.s-table th.r { text-align:right; }
+.s-table td { padding:0.65rem 0.75rem; border-bottom:0.5px solid #f3f4f6; color:#374151; vertical-align:middle; }
+.s-table td.r { text-align:right; font-family:'DM Mono',monospace; font-size:0.82rem; color:#111111; white-space:nowrap; }
+.s-table tr:last-child td { border-bottom:none; }
+.s-bar-bg { background:#f3f4f6; border-radius:2px; height:4px; width:100%; min-width:80px; }
+.s-bar-fill { background:#2563eb; border-radius:2px; height:4px; }
+
+/* SAVED PORTFOLIOS */
+.saved-row { display:flex; align-items:center; padding:0.6rem 0; border-bottom:0.5px solid #f3f4f6; gap:0.75rem; }
+.saved-row:last-child { border-bottom:none; }
+.saved-name { flex:1; font-size:0.875rem; font-weight:500; color:#111111; }
+.saved-tickers { font-size:0.75rem; color:#6b7280; font-family:'DM Mono',monospace; }
+
+/* AI ANALYSIS */
+.ai-text { font-size:0.9375rem; line-height:1.8; color:#374151; font-weight:400; }
+
+/* FOLLOW-UP Q&A */
+.qa-divider { border:none; border-top:1px solid #e5e7eb; margin:1.5rem 0 1.25rem 0; }
+.qa-question { font-size:0.8rem; font-weight:600; color:#374151; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:0.5rem; }
+.qa-answer { font-size:0.9375rem; line-height:1.8; color:#374151; margin-bottom:1.25rem; padding-bottom:1.25rem; border-bottom:0.5px solid #f3f4f6; }
+.qa-answer:last-child { border-bottom:none; }
+
+/* CAPTION */
+.pit-caption { font-size:0.72rem; color:#9ca3af; margin-top:0.875rem; line-height:1.6; }
+
+/* ALERTS */
+.pit-warn { background:#fffbeb; border:0.5px solid #fcd34d; border-radius:6px; padding:0.6rem 0.875rem; font-size:0.8rem; color:#92400e; margin-top:0.5rem; line-height:1.5; }
+.pit-alert { background:#fef2f2; border:0.5px solid #fca5a5; border-radius:6px; padding:0.6rem 0.875rem; font-size:0.8rem; color:#991b1b; margin-top:0.5rem; line-height:1.5; }
+.pit-success { background:#f0fdf4; border:0.5px solid #86efac; border-radius:6px; padding:0.6rem 0.875rem; font-size:0.8rem; color:#166534; margin-top:0.5rem; line-height:1.5; }
+
+/* BUTTONS */
+div.stButton > button { background-color:#2563eb !important; color:white !important; border:none !important; border-radius:6px !important; padding:0.6rem 1.5rem !important; font-family:'DM Sans',sans-serif !important; font-size:0.875rem !important; font-weight:500 !important; cursor:pointer !important; width:100% !important; margin-top:0.75rem !important; }
+div.stButton > button:hover { background-color:#1d4ed8 !important; }
+div[data-testid="stFormSubmitButton"] > button { background-color:#2563eb !important; color:white !important; border:none !important; border-radius:6px !important; padding:0.6rem 1.5rem !important; font-family:'DM Sans',sans-serif !important; font-size:0.875rem !important; font-weight:500 !important; width:100% !important; margin-top:0.75rem !important; }
+div[data-testid="stFormSubmitButton"] > button:hover { background-color:#1d4ed8 !important; }
+
+/* STREAMLIT OVERRIDES */
+.stTextInput input { border-radius:6px !important; border:0.5px solid #e5e7eb !important; font-family:'DM Sans',sans-serif !important; font-size:0.875rem !important; background:#fff !important; color:#111111 !important; padding:0.5rem 0.75rem !important; }
+.stTextInput input:focus { border-color:#2563eb !important; box-shadow:0 0 0 2px rgba(37,99,235,0.1) !important; }
+.stNumberInput input { border-radius:6px !important; border:0.5px solid #e5e7eb !important; font-family:'DM Mono',monospace !important; font-size:0.875rem !important; background:#fff !important; color:#111111 !important; }
+.stTextArea textarea { border-radius:6px !important; border:0.5px solid #e5e7eb !important; font-family:'DM Mono',monospace !important; font-size:0.85rem !important; background:#fff !important; color:#111111 !important; }
+.stTextArea textarea:focus { border-color:#2563eb !important; box-shadow:0 0 0 2px rgba(37,99,235,0.1) !important; }
+div[data-testid="stRadio"] label { font-family:'DM Sans',sans-serif !important; font-size:0.875rem !important; color:#374151 !important; }
+.stProgress > div > div { background-color:#2563eb !important; }
+label[data-testid="stWidgetLabel"] p { font-family:'DM Sans',sans-serif !important; font-size:0.8rem !important; color:#6b7280 !important; font-weight:500 !important; }
+
+/* MISC */
+.pit-divider { border:none; border-top:0.5px solid #e5e7eb; margin:1.5rem 0; }
+.pit-empty { text-align:center; padding:3rem 1.5rem; color:#9ca3af; font-size:0.875rem; }
+.pit-empty-icon { font-size:2rem; margin-bottom:0.75rem; opacity:0.4; }
+</style>
+""", unsafe_allow_html=True)
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+AI_TIMEOUT_SECONDS = 45
+
 try:
     api_key = st.secrets["ANTHROPIC_API_KEY"]
 except Exception:
-    api_key = None
-    st.error("API key not found. Please add it to your .streamlit/secrets.toml file.")
+    st.error("API key not found. Please add ANTHROPIC_API_KEY to .streamlit/secrets.toml")
     st.stop()
 
-# --- Risk-free rate fallback ---
-# Used in Sharpe ratio calculation. We attempt to fetch the live 13-week
-# T-bill yield from Yahoo Finance (^IRX). If that fails for any reason,
-# we fall back to this hardcoded value. Update this occasionally if the
-# Fed makes major rate changes and live fetching is broken.
-RISK_FREE_RATE_FALLBACK = 4.3  # percent, annualized
+# ============================================================
+# SESSION STATE
+# ============================================================
+for key, default in [
+    ("results_ready", False),
+    ("df", None),
+    ("summary", {}),
+    ("ai_analysis", ""),
+    ("ai_failed", False),
+    ("active_tab", "summary"),
+    ("pending_holdings", {}),
+    ("qa_history", []),
+    ("portfolio_context", ""),
+    ("save_msg", ""),        # feedback after save/delete
+    ("save_msg_type", ""),   # "success" or "error"
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-# --- Session state initialization ---
-if "results_ready" not in st.session_state:
-    st.session_state.results_ready = False
-if "df" not in st.session_state:
-    st.session_state.df = None
-if "summary" not in st.session_state:
-    st.session_state.summary = {}
-if "ai_analysis" not in st.session_state:
-    st.session_state.ai_analysis = ""
-if "warnings" not in st.session_state:
-    st.session_state.warnings = []
-if "missing_data_notes" not in st.session_state:
-    st.session_state.missing_data_notes = []
+# ============================================================
+# PURE HELPERS (UI-level only)
+# ============================================================
 
-# --- Helper: detect ETF ---
-def is_etf(info):
-    quote_type = info.get("quoteType", "").upper()
-    return quote_type == "ETF"
+def fix_dollar_formatting(text: str) -> str:
+    return text.replace("`", "")
 
-# --- Helper: fix dollar sign formatting from AI output ---
-def fix_dollar_formatting(text):
-    text = text.replace("`", "")
-    return text
 
-# --- Helper: check data freshness ---
-def check_data_freshness(history):
-    if history.empty:
-        return False
-    last_date = history.index[-1].date()
-    today = datetime.today().date()
-    days_since = (today - last_date).days
-    return days_since <= 4
-
-# --- Helper: calculate max drawdown for a single price series ---
-def calc_max_drawdown(price_series):
-    if len(price_series) < 2:
-        return None
-    running_peak = price_series.cummax()
-    drawdown = (price_series - running_peak) / running_peak * 100
-    return round(drawdown.min(), 2)
-
-# --- NEW: Fetch live risk-free rate from Yahoo Finance ---
-# Pulls the 13-week T-bill yield (^IRX), which is the standard proxy
-# for the risk-free rate used in Sharpe ratio calculations.
-# Falls back to RISK_FREE_RATE_FALLBACK if the fetch fails.
-def get_risk_free_rate():
+def corr_cell_style(val) -> str:
     try:
-        irx = yf.Ticker("^IRX")
-        hist = irx.history(period="5d")
-        if not hist.empty:
-            rate = round(hist["Close"].iloc[-1], 2)
-            if rate > 0:
-                return rate
-        return RISK_FREE_RATE_FALLBACK
+        val = float(val)
     except Exception:
-        return RISK_FREE_RATE_FALLBACK
+        return ""
+    if val >= 0.8:   return "background:#ef4444;color:white;"
+    if val >= 0.6:   return "background:#f97316;color:white;"
+    if val >= 0.4:   return "background:#fbbf24;color:#111111;"
+    if val >= 0.2:   return "background:#bbf7d0;color:#111111;"
+    if val >= 0.0:   return "background:#f9fafb;color:#374151;"
+    if val >= -0.2:  return "background:#eff6ff;color:#1e40af;"
+    return "background:#dbeafe;color:#1e40af;"
 
 
-# --- Data fetch ---
-def get_ticker_data(ticker):
+def parse_paste_input(raw_text: str, mode: str = "dollars") -> tuple:
+    results, errors = {}, []
+    for i, line in enumerate(raw_text.strip().split("\n"), 1):
+        line = line.strip()
+        if not line:
+            continue
+        parts = re.split(r"[\s\t]+", line)
+        if len(parts) < 2:
+            errors.append(f"Line {i}: '{line}' — expected TICKER and a number")
+            continue
+        raw_ticker = parts[0].upper()
+        raw_value = parts[1].replace("%", "").replace("$", "").replace(",", "")
+        try:
+            value = float(raw_value)
+        except ValueError:
+            errors.append(f"Line {i}: '{line}' — '{parts[1]}' is not a valid number")
+            continue
+        if value <= 0:
+            errors.append(f"Line {i}: '{raw_ticker}' — value must be greater than zero")
+            continue
+        if mode == "percentages" and value > 100:
+            errors.append(f"Line {i}: '{raw_ticker}' — {value}% exceeds 100%")
+            continue
+        if raw_ticker in results:
+            errors.append(f"Line {i}: '{raw_ticker}' appears more than once — using first entry")
+            continue
+        results[raw_ticker] = value
+    return results, errors
+
+
+def percentages_to_dollars(pct_dict: dict, total_value: float) -> dict:
+    return {t: round(p / 100 * total_value, 2) for t, p in pct_dict.items()}
+
+
+def parse_csv_upload(file_bytes: bytes) -> tuple:
+    warnings, holdings = [], {}
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        history = stock.history(period="1y")
+        try:
+            df = pd.read_csv(io.BytesIO(file_bytes))
+        except Exception:
+            df = pd.read_csv(io.BytesIO(file_bytes), skiprows=1)
+        df.columns = [str(c).strip() for c in df.columns]
 
-        missing = []
-        warnings = []
-        ticker_is_etf = is_etf(info)
+        ticker_col = next((c for c in ["Symbol", "Ticker", "TICKER", "SYMBOL", "Symb"] if c in df.columns), None)
+        value_col  = next((c for c in ["Current Value", "Market Value", "Value", "Mkt Val", "Market Val", "Current Val", "Amount"] if c in df.columns), None)
 
-        if not check_data_freshness(history):
-            warnings.append(ticker + ": price data may be stale — market could be closed or data delayed")
+        if ticker_col is None:
+            return {}, ["Could not find a ticker/symbol column. Expected 'Symbol' or 'Ticker'."]
+        if value_col is None:
+            return {}, ["Could not find a value column. Expected 'Current Value' or 'Market Value'."]
 
-        current_price = info.get("currentPrice") or info.get("regularMarketPrice")
-        if current_price is None:
-            missing.append("current price")
+        skipped_rows = []
+        for _, row in df.iterrows():
+            raw_ticker = str(row[ticker_col]).strip()
+            raw_value  = str(row[value_col]).strip()
+            if not raw_ticker or raw_ticker in ("--", "nan", "N/A", ""):
+                continue
+            if any(kw in raw_ticker.upper() for kw in ["CASH", "SWEEP", "MONEY MARKET", "MM "]):
+                continue
+            cleaned = re.sub(r"[$,\s]", "", raw_value).replace("(", "-").replace(")", "")
+            try:
+                amount = float(cleaned)
+            except ValueError:
+                skipped_rows.append(f"{raw_ticker} (could not parse '{raw_value}')")
+                continue
+            if amount <= 0:
+                continue
+            ticker = raw_ticker.upper()
+            holdings[ticker] = holdings.get(ticker, 0) + round(amount, 2)
 
-        if ticker_is_etf:
-            sector = "ETF (diversified)"
-            beta = info.get("beta3Year") or info.get("beta") or 1.0
-        else:
-            sector = info.get("sector", None)
-            if sector is None:
-                sector = "Unknown"
-                missing.append("sector")
-            beta = info.get("beta", None)
-            if beta is None:
-                beta = 1.0
-                missing.append("beta (defaulted to 1.0)")
-
-        if len(history) > 1:
-            daily_returns = history["Close"].pct_change().dropna()
-            volatility = round(daily_returns.std() * (252 ** 0.5) * 100, 2)
-        else:
-            volatility = None
-            missing.append("volatility")
-
-        max_drawdown = calc_max_drawdown(history["Close"]) if len(history) > 1 else None
-
-        return {
-            "ticker": ticker,
-            "current_price": current_price,
-            "sector": sector,
-            "beta": beta,
-            "volatility": volatility,
-            "max_drawdown": max_drawdown,
-            "missing": missing,
-            "warnings": warnings,
-            "is_etf": ticker_is_etf,
-            "history": history,
-            "valid": True
-        }
-
+        if skipped_rows:
+            warnings.append("Skipped: " + ", ".join(skipped_rows))
+        return holdings, warnings
     except Exception as e:
-        return {"ticker": ticker, "valid": False, "error": str(e)}
+        return {}, [f"Failed to parse CSV: {e}"]
 
 
-# --- Fetch SPY benchmark data ---
-def get_spy_benchmark(existing_histories=None):
-    try:
-        if existing_histories and "SPY" in existing_histories:
-            history = existing_histories["SPY"]
-        else:
-            spy = yf.Ticker("SPY")
-            history = spy.history(period="1y")
+# ============================================================
+# ANALYSIS ENGINE
+# ============================================================
 
-        if len(history) < 2:
-            return None
+def run_analysis(holdings: dict) -> None:
+    """
+    Stage 1 — fetch data and compute metrics, write to session state.
+    Stage 2 — AI analysis (failure here still shows all metrics).
+    """
+    rows, missing_data_notes, warnings, skipped, ticker_histories = [], [], [], [], {}
 
-        daily_returns = history["Close"].pct_change().dropna()
-        spy_volatility = round(daily_returns.std() * (252 ** 0.5) * 100, 2)
-
-        start_price = history["Close"].iloc[0]
-        end_price = history["Close"].iloc[-1]
-        spy_return = round((end_price - start_price) / start_price * 100, 2)
-
-        return {
-            "volatility": spy_volatility,
-            "one_year_return": spy_return,
-            "beta": 1.0,
-            "close_series": history["Close"]
-        }
-    except Exception:
-        return None
-
-
-# --- Calculate portfolio return, max drawdown, and Sharpe ratio ---
-# Builds a weighted daily portfolio value series, then computes:
-# 1. Total 1-year return
-# 2. Worst peak-to-trough drawdown
-# 3. Sharpe ratio: (portfolio_return - risk_free_rate) / portfolio_volatility
-def get_portfolio_stats(df, holdings, ticker_histories, weighted_volatility, risk_free_rate):
-    try:
-        close_frames = {}
-        for ticker in df["Ticker"]:
-            if ticker in ticker_histories and len(ticker_histories[ticker]) > 1:
-                close_frames[ticker] = ticker_histories[ticker]["Close"]
-
-        if not close_frames:
-            return None, None, None
-
-        price_df = pd.DataFrame(close_frames)
-        price_df = price_df.dropna()
-
-        if len(price_df) < 2:
-            return None, None, None
-
-        total = df["Amount Invested"].sum()
-
-        portfolio_series = pd.Series(0.0, index=price_df.index)
-        for ticker in close_frames:
-            amount = holdings.get(ticker, 0)
-            normalized = price_df[ticker] / price_df[ticker].iloc[0]
-            portfolio_series += normalized * amount
-
-        start_val = portfolio_series.iloc[0]
-        end_val = portfolio_series.iloc[-1]
-        portfolio_return = round((end_val - start_val) / start_val * 100, 2)
-
-        portfolio_max_drawdown = calc_max_drawdown(portfolio_series)
-
-        # --- NEW: Sharpe ratio ---
-        # Formula: (portfolio_return - risk_free_rate) / portfolio_volatility
-        # Both return and volatility are in percent, so units cancel cleanly.
-        sharpe_ratio = None
-        if weighted_volatility and weighted_volatility > 0:
-            sharpe_ratio = round((portfolio_return - risk_free_rate) / weighted_volatility, 2)
-
-        return portfolio_return, portfolio_max_drawdown, sharpe_ratio
-
-    except Exception:
-        return None, None, None
-
-
-# --- Calculate correlation matrix ---
-def get_correlation_matrix(ticker_histories):
-    try:
-        returns_frames = {}
-        for ticker, history in ticker_histories.items():
-            if len(history) > 1:
-                daily_returns = history["Close"].pct_change().dropna()
-                returns_frames[ticker] = daily_returns
-
-        if len(returns_frames) < 2:
-            return None, []
-
-        returns_df = pd.DataFrame(returns_frames)
-        returns_df = returns_df.dropna()
-
-        if len(returns_df) < 20:
-            return None, []
-
-        corr_matrix = returns_df.corr().round(2)
-
-        high_corr_pairs = []
-        tickers = corr_matrix.columns.tolist()
-        for i in range(len(tickers)):
-            for j in range(i + 1, len(tickers)):
-                val = corr_matrix.iloc[i, j]
-                if val >= 0.8:
-                    high_corr_pairs.append({
-                        "pair": tickers[i] + " & " + tickers[j],
-                        "correlation": val
-                    })
-
-        high_corr_pairs.sort(key=lambda x: x["correlation"], reverse=True)
-
-        return corr_matrix, high_corr_pairs
-
-    except Exception:
-        return None, []
-
-
-# --- Portfolio analysis ---
-def analyze_portfolio(holdings):
-    rows = []
-    missing_data_notes = []
-    warnings = []
-    skipped = []
-    ticker_histories = {}
-
-    progress = st.progress(0, text="Fetching data...")
+    progress = st.progress(0, text="Fetching market data…")
     tickers = list(holdings.keys())
 
     for i, ticker in enumerate(tickers):
-        progress.progress((i + 1) / len(tickers), text="Fetching data for " + ticker + "...")
+        progress.progress((i + 1) / len(tickers), text=f"Fetching {ticker}…")
         data = get_ticker_data(ticker)
 
         if not data["valid"]:
-            skipped.append(ticker + " (" + data.get("error", "unknown error") + ")")
+            skipped.append(f"{ticker} — {data.get('error', 'unknown error')}")
             continue
 
         if data["missing"]:
             if data["is_etf"]:
-                missing_data_notes.append(ticker + " is an ETF — sector and some metrics are not applicable")
+                missing_data_notes.append(f"{ticker} is an ETF — sector/beta not applicable")
             else:
-                missing_data_notes.append(ticker + " is missing: " + ", ".join(data["missing"]))
+                missing_data_notes.append(f"{ticker} missing: {', '.join(data['missing'])}")
 
-        if data["warnings"]:
-            warnings.extend(data["warnings"])
-
+        warnings.extend(data.get("warnings", []))
         ticker_histories[ticker] = data["history"]
-
         rows.append({
-            "Ticker": ticker,
+            "Ticker":          ticker,
             "Amount Invested": holdings[ticker],
-            "Sector": data["sector"],
-            "Beta": data["beta"],
-            "Volatility %": data["volatility"],
-            "Max Drawdown %": data["max_drawdown"],
-            "Type": "ETF" if data["is_etf"] else "Stock"
+            "Sector":          data["sector"],
+            "Beta":            data["beta"],
+            "Volatility %":    data["volatility"],
+            "Max Drawdown %":  data["max_drawdown"],
+            "Type":            "ETF" if data["is_etf"] else "Stock",
         })
 
     progress.empty()
 
     if not rows:
-        st.error("No valid tickers found. Please check your inputs.")
+        st.error("No valid tickers found. Check your ticker symbols and try again.")
         return
 
     df = pd.DataFrame(rows)
     total = df["Amount Invested"].sum()
     df["Allocation %"] = (df["Amount Invested"] / total * 100).round(2)
-    df["Weighted Beta"] = df["Beta"] * (df["Amount Invested"] / total)
-    weighted_beta = df["Weighted Beta"].sum().round(3)
 
-    valid_vol = df.dropna(subset=["Volatility %"])
-    if not valid_vol.empty:
-        weighted_volatility = round(
-            (valid_vol["Volatility %"] * (valid_vol["Amount Invested"] / total)).sum(), 2
-        )
-    else:
-        weighted_volatility = None
+    weighted_beta       = compute_weighted_beta(df, total)
+    weighted_volatility = compute_weighted_volatility(df, total)
 
     sector_breakdown = df.groupby("Sector")["Allocation %"].sum().round(2).to_dict()
-    concentrated_sectors = {s: p for s, p in sector_breakdown.items() if p > 60 and s not in ["ETF (diversified)", "Unknown"]}
+    concentrated_sectors = {
+        sec: pct for sec, pct in sector_breakdown.items()
+        if pct > 60 and sec not in ["ETF (diversified)", "Unknown"]
+    }
 
-    spy_data = get_spy_benchmark(existing_histories=ticker_histories)
+    spy_data         = get_spy_benchmark(existing_histories=ticker_histories)
+    risk_free_rate   = get_risk_free_rate()
 
-    # --- NEW: fetch live risk-free rate ---
-    risk_free_rate = get_risk_free_rate()
-
-    # --- UPDATED: get_portfolio_stats now returns return, drawdown, and Sharpe ---
-    portfolio_return, portfolio_max_drawdown, sharpe_ratio = get_portfolio_stats(
+    portfolio_return, portfolio_max_drawdown, sharpe_ratio = compute_portfolio_stats(
         df, holdings, ticker_histories, weighted_volatility, risk_free_rate
     )
 
-    # --- NEW: calculate SPY Sharpe ratio for benchmark comparison ---
     spy_sharpe = None
     if spy_data and spy_data["volatility"] and spy_data["volatility"] > 0:
-        spy_sharpe = round(
-            (spy_data["one_year_return"] - risk_free_rate) / spy_data["volatility"], 2
-        )
+        spy_sharpe = round((spy_data["one_year_return"] - risk_free_rate) / spy_data["volatility"], 2)
 
-    corr_matrix, high_corr_pairs = get_correlation_matrix(ticker_histories)
+    corr_matrix, high_corr_pairs = compute_correlation_matrix(ticker_histories)
 
-    # Build context strings for AI prompt
-    corr_context = ""
-    if high_corr_pairs:
-        pair_strings = [p["pair"] + " (" + str(p["correlation"]) + ")" for p in high_corr_pairs]
-        corr_context = "High correlation pairs (above 0.80): " + ", ".join(pair_strings) + ". "
-    elif corr_matrix is not None:
-        corr_context = "No holdings pairs have correlation above 0.80 — diversification across holdings is reasonable. "
-
-    drawdown_context = ""
-    if portfolio_max_drawdown is not None:
-        drawdown_context += "Portfolio max drawdown (worst peak-to-trough drop over past year): " + str(portfolio_max_drawdown) + "%. "
-    valid_dd = df.dropna(subset=["Max Drawdown %"])
-    if not valid_dd.empty:
-        worst_holding = valid_dd.loc[valid_dd["Max Drawdown %"].idxmin()]
-        drawdown_context += (
-            "Worst individual holding drawdown: " + worst_holding["Ticker"] +
-            " at " + str(worst_holding["Max Drawdown %"]) + "%. "
-        )
-
-    sharpe_context = ""
-    if sharpe_ratio is not None:
-        sharpe_context = (
-            "Portfolio Sharpe Ratio: " + str(sharpe_ratio) +
-            " (risk-free rate used: " + str(risk_free_rate) + "%). "
-        )
-        if spy_sharpe is not None:
-            sharpe_context += "SPY Sharpe Ratio: " + str(spy_sharpe) + ". "
-
-    benchmark_context = ""
-    if spy_data:
-        benchmark_context = (
-            "SPY Benchmark — Volatility: " + str(spy_data["volatility"]) + "%, "
-            "1-Year Return: " + str(spy_data["one_year_return"]) + "%. "
-        )
-    if portfolio_return is not None:
-        benchmark_context += "Portfolio 1-Year Return: " + str(portfolio_return) + "%. "
-
-    prompt = (
-        "You are a financial analyst explaining a retail investor portfolio. "
-        "Be specific, direct, and avoid generic advice. Use plain text only — no markdown, no bold, no bullet points. "
-        "Here is the portfolio data: "
-        "Total Value: $" + "{:,.2f}".format(total) + ". "
-        "Weighted Beta: " + str(weighted_beta) + ". "
-        "Weighted Annualized Volatility: " + (str(weighted_volatility) + "%" if weighted_volatility else "unavailable") + ". "
-        + benchmark_context
-        + corr_context
-        + drawdown_context
-        + sharpe_context +
-        "Sector Breakdown: " + str(sector_breakdown) + ". "
-        "Holdings: " + str(df[["Ticker", "Allocation %", "Beta", "Volatility %", "Max Drawdown %", "Type"]].to_dict(orient="records")) + ". "
-        "Missing data notes: " + (", ".join(missing_data_notes) if missing_data_notes else "none") + ". "
-        "Explain in 4-5 sentences: "
-        "1. What this portfolio is concentrated in and what that means. "
-        "2. What the beta, volatility, max drawdown, and Sharpe ratio together tell us about whether the returns justify the risk taken, compared to SPY where available. "
-        "3. How the risk is distributed across holdings — which positions are driving it, and whether high correlation creates hidden concentration risk. "
-        "4. One specific thing this investor should be aware of or watch out for."
-    )
-
-    with st.spinner("Generating AI analysis..."):
-        try:
-            client = anthropic.Anthropic(api_key=api_key)
-            message = client.messages.create(
-                model="claude-opus-4-6",
-                max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            ai_text = fix_dollar_formatting(message.content[0].text)
-        except Exception as e:
-            ai_text = "AI analysis failed: " + str(e)
-
-    st.session_state.results_ready = True
-    st.session_state.df = df
-    st.session_state.summary = {
-        "total": total,
-        "weighted_beta": weighted_beta,
+    summary = {
+        "total": total, "weighted_beta": weighted_beta,
         "weighted_volatility": weighted_volatility,
         "sector_breakdown": sector_breakdown,
         "concentrated_sectors": concentrated_sectors,
-        "skipped": skipped,
-        "missing_data_notes": missing_data_notes,
-        "warnings": warnings,
-        "spy_data": spy_data,
+        "skipped": skipped, "missing_data_notes": missing_data_notes,
+        "warnings": warnings, "spy_data": spy_data,
         "portfolio_return": portfolio_return,
         "portfolio_max_drawdown": portfolio_max_drawdown,
-        "sharpe_ratio": sharpe_ratio,       # ← NEW
-        "spy_sharpe": spy_sharpe,           # ← NEW
-        "risk_free_rate": risk_free_rate,   # ← NEW
-        "corr_matrix": corr_matrix,
-        "high_corr_pairs": high_corr_pairs
+        "sharpe_ratio": sharpe_ratio, "spy_sharpe": spy_sharpe,
+        "risk_free_rate": risk_free_rate,
+        "corr_matrix": corr_matrix, "high_corr_pairs": high_corr_pairs,
+        "holdings": holdings,
     }
-    st.session_state.ai_analysis = ai_text
 
-
-# --- Input Section ---
-input_method = st.radio("How would you like to enter your portfolio?", ["One by one", "Paste a list"])
-
-holdings = {}
-
-if input_method == "One by one":
-    st.write("Add each ticker and the dollar amount you have invested.")
-    num_holdings = st.number_input("How many holdings?", min_value=1, max_value=20, value=3, step=1)
-    for i in range(int(num_holdings)):
-        col1, col2 = st.columns(2)
-        with col1:
-            ticker = st.text_input("Ticker", key="ticker_" + str(i), placeholder="e.g. AAPL").upper().strip()
-        with col2:
-            amount = st.number_input("Amount Invested ($)", min_value=0.0, key="amount_" + str(i), step=100.0)
-        if ticker and amount > 0:
-            holdings[ticker] = amount
-
-else:
-    st.write("Paste your portfolio below. One holding per line, formatted as: TICKER AMOUNT")
-    st.code("AAPL 2000\nTSLA 1000\nSPY 3000")
-    raw_input = st.text_area("Paste your portfolio here", height=150)
-    if raw_input:
-        for line in raw_input.strip().split("\n"):
-            parts = line.strip().split()
-            if len(parts) == 2:
-                try:
-                    ticker = parts[0].upper()
-                    amount = float(parts[1])
-                    if amount > 0:
-                        holdings[ticker] = amount
-                except ValueError:
-                    st.warning("Skipped invalid line: " + line)
-
-if st.button("Analyze Portfolio"):
-    if not holdings:
-        st.error("Please enter at least one valid holding.")
-    else:
-        analyze_portfolio(holdings)
-
-# --- Display Results ---
-if st.session_state.results_ready:
-    df = st.session_state.df
-    s = st.session_state.summary
-
-    # --- Summary Metrics: five columns ---
-    st.subheader("Portfolio Summary")
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Total Value", "$" + "{:,.2f}".format(s["total"]))
-    col2.metric("Weighted Beta", str(s["weighted_beta"]))
-    col3.metric("Weighted Volatility", str(s["weighted_volatility"]) + "%" if s["weighted_volatility"] else "N/A")
-    col4.metric(
-        "Max Drawdown",
-        str(s["portfolio_max_drawdown"]) + "%" if s["portfolio_max_drawdown"] is not None else "N/A"
-    )
-    col5.metric(
-        "Sharpe Ratio",
-        str(s["sharpe_ratio"]) if s["sharpe_ratio"] is not None else "N/A"
+    portfolio_context = build_portfolio_context(
+        df, summary, portfolio_return, portfolio_max_drawdown,
+        sharpe_ratio, spy_data, spy_sharpe, risk_free_rate,
+        high_corr_pairs, corr_matrix,
     )
 
-    # --- Benchmark Comparison ---
-    spy = s.get("spy_data")
-    port_return = s.get("portfolio_return")
-    spy_sharpe = s.get("spy_sharpe")
-    risk_free_rate = s.get("risk_free_rate", RISK_FREE_RATE_FALLBACK)
+    # Write metrics now — AI failure won't wipe these
+    st.session_state.update({
+        "results_ready":     True,
+        "df":                df,
+        "active_tab":        "summary",
+        "summary":           summary,
+        "portfolio_context": portfolio_context,
+        "qa_history":        [],
+        "ai_analysis":       "",
+        "ai_failed":         False,
+    })
 
-    if spy:
-        st.subheader("Benchmark Comparison (vs. SPY)")
-        comparison_rows = [
-            {
-                "Metric": "Beta",
-                "Your Portfolio": str(s["weighted_beta"]),
-                "SPY (Benchmark)": "1.00"
-            },
-            {
-                "Metric": "Annualized Volatility",
-                "Your Portfolio": str(s["weighted_volatility"]) + "%" if s["weighted_volatility"] else "N/A",
-                "SPY (Benchmark)": str(spy["volatility"]) + "%"
-            },
-            {
-                "Metric": "1-Year Return",
-                "Your Portfolio": (("+" if port_return >= 0 else "") + str(port_return) + "%") if port_return is not None else "N/A",
-                "SPY (Benchmark)": ("+" if spy["one_year_return"] >= 0 else "") + str(spy["one_year_return"]) + "%"
-            },
-            {
-                "Metric": "Sharpe Ratio",
-                "Your Portfolio": str(s["sharpe_ratio"]) if s["sharpe_ratio"] is not None else "N/A",
-                "SPY (Benchmark)": str(spy_sharpe) if spy_sharpe is not None else "N/A"
-            }
-        ]
-        comparison_df = pd.DataFrame(comparison_rows)
-        st.dataframe(comparison_df.set_index("Metric"), width='stretch')
-        st.caption(
-            "Beta measures sensitivity to market moves — SPY's beta is always 1.0 by definition. "
-            "Volatility is annualized from 1 year of daily returns. "
-            "1-Year Return is calculated from daily price history and may differ slightly from brokerage statements due to dividend handling. "
-            "Sharpe Ratio = (Return - Risk-Free Rate) / Volatility. "
-            "Risk-free rate used: " + str(risk_free_rate) + "% (live 13-week T-bill yield). "
-            "A Sharpe Ratio above 1.0 is generally considered good. Above 2.0 is strong."
+    # Stage 2: AI
+    prompt = (
+        "You are a senior portfolio analyst. Give the investor a direct, unvarnished read of their portfolio. "
+        "Write like you're sending a quick internal note to a colleague — terse, specific, no hedging. "
+        "No markdown, no bold, no bullet points. Plain prose only. "
+        "No phrases like 'it may be worth considering' or 'investors should be aware'. "
+        "Call things what they are. If risk is high, say so. If diversification is poor, say so. "
+        "Do not pad. Every sentence should carry information.\n\n"
+        + portfolio_context + "\n\n"
+        "Write 4-5 sentences covering:\n"
+        "1. What this portfolio is actually concentrated in and what that exposure means.\n"
+        "2. Whether the returns justify the risk — use beta, volatility, drawdown, and Sharpe vs SPY specifically.\n"
+        "3. Which holdings drive risk and whether any correlations create hidden concentration.\n"
+        "4. The one specific thing this investor needs to watch."
+    )
+
+    with st.spinner("Generating analysis…"):
+        try:
+            client = anthropic.Anthropic(api_key=api_key, timeout=AI_TIMEOUT_SECONDS)
+            message = client.messages.create(
+                model="claude-opus-4-6",
+                max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            st.session_state.ai_analysis = fix_dollar_formatting(message.content[0].text)
+        except anthropic.APITimeoutError:
+            st.session_state.ai_failed = True
+            st.session_state.ai_analysis = (
+                "Analysis timed out. Your portfolio metrics above are accurate. "
+                "Try switching to the AI Analysis tab and refreshing."
+            )
+        except Exception:
+            st.session_state.ai_failed = True
+            st.session_state.ai_analysis = (
+                "Analysis could not be generated right now. "
+                "Your portfolio metrics are accurate."
+            )
+
+
+def answer_question(question: str) -> str:
+    prompt = (
+        "You are a senior portfolio analyst. Answer a client follow-up question. "
+        "Use actual numbers from their portfolio. No markdown, no bullets. Plain prose. "
+        "Be terse. If the answer is short, keep it short.\n\n"
+        + st.session_state.portfolio_context + "\n\n"
+        "Client question: " + question
+    )
+    try:
+        client = anthropic.Anthropic(api_key=api_key, timeout=AI_TIMEOUT_SECONDS)
+        message = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}],
         )
+        return fix_dollar_formatting(message.content[0].text)
+    except anthropic.APITimeoutError:
+        return "The AI service timed out. Please try again."
+    except Exception:
+        return "Could not generate an answer right now. Please try again."
 
-    # --- Correlation Matrix ---
-    corr_matrix = s.get("corr_matrix")
-    high_corr_pairs = s.get("high_corr_pairs", [])
 
-    if corr_matrix is not None:
-        st.subheader("Correlation Matrix")
+# ============================================================
+# PAGE HEADER
+# ============================================================
+st.markdown("""
+<div class="pit-header">
+    <div class="pit-header-title">Portfolio Insight Tool</div>
+    <div class="pit-header-sub">Institutional-grade portfolio analysis</div>
+</div>
+""", unsafe_allow_html=True)
 
-        def color_correlation(val):
-            if val == 1.0:
-                return "background-color: #c0392b; color: white;"
-            elif val >= 0.8:
-                return "background-color: #e74c3c; color: white;"
-            elif val >= 0.6:
-                return "background-color: #e67e22; color: white;"
-            elif val >= 0.4:
-                return "background-color: #f39c12; color: black;"
-            elif val >= 0.2:
-                return "background-color: #d4efdf; color: black;"
-            else:
-                return "background-color: #27ae60; color: white;"
+# ============================================================
+# INPUT SECTION
+# ============================================================
+if not st.session_state.results_ready:
+    st.markdown('<div style="height:1.5rem;"></div>', unsafe_allow_html=True)
 
-        styled_corr = corr_matrix.style.map(color_correlation).format("{:.2f}")
-        st.dataframe(styled_corr, width='stretch')
+    # ---- Saved portfolios panel ----
+    saved_names = list_portfolios()
+    if saved_names:
+        st.markdown('<div class="pit-surface">', unsafe_allow_html=True)
+        st.markdown('<div class="pit-label">Saved Portfolios</div>', unsafe_allow_html=True)
 
-        st.caption(
-            "Correlation ranges from -1.0 to 1.0. "
-            "1.0 means two holdings move in perfect lockstep. "
-            "0.0 means no relationship. "
-            "Negative values mean they tend to move in opposite directions. "
-            "Pairs above 0.80 are highlighted in red — they may look diversified but behave as one position in a downturn."
-        )
+        for name in saved_names:
+            holdings_preview = load_portfolio(name) or {}
+            ticker_str = "  ·  ".join(list(holdings_preview.keys())[:6])
+            if len(holdings_preview) > 6:
+                ticker_str += f"  +{len(holdings_preview)-6} more"
 
-        if high_corr_pairs:
-            for pair in high_corr_pairs:
-                st.warning(
-                    "High Correlation: " + pair["pair"] + " have a correlation of " +
-                    str(pair["correlation"]) + " — these holdings tend to move together and may not provide the diversification they appear to."
+            col_name, col_load, col_del = st.columns([4, 1, 1])
+            with col_name:
+                st.markdown(
+                    f'<div class="saved-name">{name}'
+                    f'<br><span class="saved-tickers">{ticker_str}</span></div>',
+                    unsafe_allow_html=True
                 )
+            with col_load:
+                if st.button("Load", key=f"load_{name}"):
+                    holdings = load_portfolio(name)
+                    if holdings:
+                        run_analysis(holdings)
+                        st.rerun()
+            with col_del:
+                if st.button("Delete", key=f"del_{name}"):
+                    ok, msg = delete_portfolio(name)
+                    st.session_state.save_msg = msg
+                    st.session_state.save_msg_type = "success" if ok else "error"
+                    st.rerun()
 
-    # --- Portfolio Table ---
-    st.subheader("Portfolio Breakdown")
-    st.dataframe(
-        df[["Ticker", "Type", "Amount Invested", "Allocation %", "Sector", "Beta", "Volatility %", "Max Drawdown %"]].reset_index(drop=True),
-        width='stretch'
+        if st.session_state.save_msg:
+            cls = "pit-success" if st.session_state.save_msg_type == "success" else "pit-warn"
+            st.markdown(f'<div class="{cls}">{st.session_state.save_msg}</div>', unsafe_allow_html=True)
+            st.session_state.save_msg = ""
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # ---- Input panel ----
+    st.markdown('<div class="pit-surface">', unsafe_allow_html=True)
+    st.markdown('<div class="pit-label">Portfolio Input</div>', unsafe_allow_html=True)
+
+    input_method = st.radio(
+        "Input method",
+        ["Enter holdings", "Paste a list", "Percentages", "Upload CSV"],
+        horizontal=True,
+        label_visibility="collapsed",
     )
 
-    # --- Sector Breakdown ---
-    st.subheader("Sector Breakdown")
-    sector_df = pd.DataFrame(list(s["sector_breakdown"].items()), columns=["Sector", "Allocation %"])
-    st.dataframe(sector_df, width='stretch')
+    holdings: dict = {}
+    input_errors: list = []
 
-    if s["concentrated_sectors"]:
-        for sector, pct in s["concentrated_sectors"].items():
-            st.warning("Concentration Warning: " + str(pct) + "% of this portfolio is in " + sector)
+    # METHOD 1: one by one
+    if input_method == "Enter holdings":
+        st.markdown('<p class="pit-input-hint">Enter a ticker and dollar amount, then click Add.</p>', unsafe_allow_html=True)
+        col1, col2, col3 = st.columns([2, 2, 1])
+        with col1:
+            new_ticker = st.text_input("Ticker", placeholder="e.g. AAPL", label_visibility="collapsed", key="new_ticker").upper().strip()
+        with col2:
+            new_amount = st.number_input("Amount ($)", min_value=0.0, step=100.0, label_visibility="collapsed", key="new_amount")
+        with col3:
+            if st.button("Add", key="add_btn"):
+                if new_ticker and new_amount > 0:
+                    st.session_state.pending_holdings[new_ticker] = new_amount
+                    st.rerun()
 
-    if s["warnings"]:
-        for w in s["warnings"]:
-            st.warning(w)
+        if st.session_state.pending_holdings:
+            st.markdown('<hr class="pit-divider">', unsafe_allow_html=True)
+            rows_html = "".join(f'<tr><td class="tk">{tk}</td><td class="r">${amt:,.0f}</td></tr>'
+                                for tk, amt in st.session_state.pending_holdings.items())
+            st.markdown(f'<table class="h-table"><thead><tr><th>Ticker</th><th class="r">Amount</th></tr></thead><tbody>{rows_html}</tbody></table>', unsafe_allow_html=True)
+            col_a, col_b = st.columns([3, 1])
+            with col_b:
+                if st.button("Clear all", key="clear_btn"):
+                    st.session_state.pending_holdings = {}
+                    st.rerun()
+        holdings = st.session_state.pending_holdings.copy()
 
-    if s["skipped"]:
-        st.warning("Skipped tickers: " + ", ".join(s["skipped"]))
+    # METHOD 2: paste dollars
+    elif input_method == "Paste a list":
+        st.markdown('<p class="pit-input-hint">One holding per line — TICKER AMOUNT. Commas OK: <code>AAPL 5,000</code></p>', unsafe_allow_html=True)
+        raw = st.text_area("", height=120, placeholder="AAPL 5000\nMSFT 3000\nSPY 2000", label_visibility="collapsed")
+        if raw.strip():
+            holdings, input_errors = parse_paste_input(raw, mode="dollars")
 
-    if s["missing_data_notes"]:
-        with st.expander("Data Notes"):
-            for note in s["missing_data_notes"]:
-                st.write("- " + note)
+    # METHOD 3: percentages
+    elif input_method == "Percentages":
+        st.markdown('<p class="pit-input-hint">One holding per line — TICKER PERCENTAGE. Must sum to 100.</p>', unsafe_allow_html=True)
+        total_value = st.number_input("Total portfolio value ($)", min_value=1.0, step=1000.0, key="pct_total_value")
+        raw = st.text_area("", height=120, placeholder="AAPL 40\nMSFT 30\nSPY 30", label_visibility="collapsed")
+        if raw.strip() and total_value > 0:
+            pct_dict, input_errors = parse_paste_input(raw, mode="percentages")
+            if pct_dict:
+                total_pct = sum(pct_dict.values())
+                if abs(total_pct - 100) > 0.5:
+                    input_errors.append(f"Percentages sum to {total_pct:.1f}% — must add up to 100%.")
+                else:
+                    holdings = percentages_to_dollars(pct_dict, total_value)
 
-    st.subheader("AI Analysis")
-    st.write(st.session_state.ai_analysis)
+    # METHOD 4: CSV
+    elif input_method == "Upload CSV":
+        st.markdown('<p class="pit-input-hint">Upload a brokerage CSV with a <strong>Symbol</strong> column and a <strong>Current Value</strong> or <strong>Market Value</strong> column. Cash positions are skipped automatically.</p>', unsafe_allow_html=True)
+        uploaded = st.file_uploader("Choose a CSV file", type=["csv"], label_visibility="collapsed")
+        if uploaded is not None:
+            holdings, csv_warnings = parse_csv_upload(uploaded.read())
+            for w in csv_warnings:
+                st.markdown(f'<div class="pit-warn">{w}</div>', unsafe_allow_html=True)
+            if holdings:
+                rows_html = "".join(f'<tr><td class="tk">{tk}</td><td class="r">${amt:,.0f}</td></tr>' for tk, amt in holdings.items())
+                st.markdown('<hr class="pit-divider">', unsafe_allow_html=True)
+                st.markdown(f'<table class="h-table"><thead><tr><th>Ticker</th><th class="r">Value</th></tr></thead><tbody>{rows_html}</tbody></table>', unsafe_allow_html=True)
+
+    for err in input_errors:
+        st.markdown(f'<div class="pit-warn">{err}</div>', unsafe_allow_html=True)
+
+    if st.button("Analyze Portfolio"):
+        if not holdings:
+            st.error("Please enter at least one holding.")
+        else:
+            run_analysis(holdings)
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# ============================================================
+# RESULTS
+# ============================================================
+if st.session_state.results_ready:
+    s  = st.session_state.summary
+    df = st.session_state.df
+
+    port_return = s.get("portfolio_return")
+    sharpe      = s.get("sharpe_ratio")
+    drawdown    = s.get("portfolio_max_drawdown")
+    vol         = s.get("weighted_volatility")
+
+    return_prefix = "+" if (port_return is not None and port_return >= 0) else ""
+    return_class  = "pos" if (port_return is not None and port_return >= 0) else "neg"
+    sharpe_class  = "good" if (sharpe is not None and sharpe >= 1.0) else ("warn" if sharpe is not None else "")
+    dd_str        = f"{drawdown}%" if drawdown is not None else "N/A"
+    vol_str       = f"{vol}%" if vol is not None else "N/A"
+    sharpe_str    = str(sharpe) if sharpe is not None else "N/A"
+    return_val    = f"{port_return}%" if port_return is not None else "N/A"
+
+    # ---- Metrics bar ----
+    st.markdown(f"""
+    <div class="pit-metrics-bar">
+        <div class="pit-metric-item"><div class="pit-metric-label">Total Value</div><div class="pit-metric-value">${s['total']:,.0f}</div></div>
+        <div class="pit-metric-item"><div class="pit-metric-label">1-Year Return</div><div class="pit-metric-value {return_class}">{return_prefix}{return_val}</div></div>
+        <div class="pit-metric-item"><div class="pit-metric-label">Beta</div><div class="pit-metric-value">{s['weighted_beta']}</div></div>
+        <div class="pit-metric-item"><div class="pit-metric-label">Volatility</div><div class="pit-metric-value">{vol_str}</div></div>
+        <div class="pit-metric-item"><div class="pit-metric-label">Max Drawdown</div><div class="pit-metric-value neg">{dd_str}</div></div>
+        <div class="pit-metric-item"><div class="pit-metric-label">Sharpe Ratio</div><div class="pit-metric-value {sharpe_class}">{sharpe_str}</div></div>
+    </div>""", unsafe_allow_html=True)
+
+    # ---- Tabs ----
+    TABS = [("summary","Summary"),("benchmark","Benchmark"),("correlation","Correlation"),
+            ("holdings","Holdings"),("sectors","Sectors"),("analysis","AI Analysis")]
+
+    st.markdown('<div style="background:#fff;border-bottom:1px solid #e5e7eb;margin-bottom:1.5rem;">', unsafe_allow_html=True)
+    tab_cols = st.columns(len(TABS))
+    for i, (col, (tab_id, tab_label)) in enumerate(zip(tab_cols, TABS)):
+        with col:
+            is_active = st.session_state.active_tab == tab_id
+            style = (
+                "background:transparent!important;color:#2563eb!important;"
+                "border-bottom:2px solid #2563eb!important;border-radius:0!important;"
+                "padding:0.75rem 0.25rem!important;font-size:0.8rem!important;"
+                "font-weight:500!important;width:100%!important;margin:0!important;box-shadow:none!important;"
+            ) if is_active else (
+                "background:transparent!important;color:#6b7280!important;"
+                "border:none!important;border-radius:0!important;"
+                "padding:0.75rem 0.25rem!important;font-size:0.8rem!important;"
+                "font-weight:500!important;width:100%!important;margin:0!important;box-shadow:none!important;"
+            )
+            st.markdown(f'<style>div[data-testid="stColumn"]:nth-child({i+1}) div.stButton>button{{{style}}}</style>', unsafe_allow_html=True)
+            if st.button(tab_label, key=f"tab_{tab_id}"):
+                st.session_state.active_tab = tab_id
+                st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    active = st.session_state.active_tab
+
+    # ---- Save portfolio + New Analysis row ----
+    col_save, col_name, col_new = st.columns([1, 2, 1])
+    with col_new:
+        if st.button("← New Analysis"):
+            st.session_state.results_ready = False
+            st.session_state.pending_holdings = {}
+            st.session_state.qa_history = []
+            st.session_state.portfolio_context = ""
+            st.rerun()
+    with col_name:
+        save_name = st.text_input("Portfolio name", placeholder="e.g. Retirement account", label_visibility="collapsed", key="save_name_input")
+    with col_save:
+        if st.button("Save Portfolio"):
+            current_holdings = s.get("holdings", {})
+            if not save_name.strip():
+                st.session_state.save_msg = "Enter a name before saving."
+                st.session_state.save_msg_type = "error"
+            elif current_holdings:
+                ok, msg = save_portfolio(save_name.strip(), current_holdings)
+                st.session_state.save_msg = msg
+                st.session_state.save_msg_type = "success" if ok else "error"
+            st.rerun()
+
+    if st.session_state.save_msg:
+        cls = "pit-success" if st.session_state.save_msg_type == "success" else "pit-warn"
+        st.markdown(f'<div class="{cls}">{st.session_state.save_msg}</div>', unsafe_allow_html=True)
+        st.session_state.save_msg = ""
+
+    st.markdown('<div style="height:0.5rem;"></div>', unsafe_allow_html=True)
+
+    # ============================================================
+    # TAB: SUMMARY
+    # ============================================================
+    if active == "summary":
+        st.markdown('<div class="pit-surface">', unsafe_allow_html=True)
+        st.markdown('<div class="pit-label">Portfolio Composition</div>', unsafe_allow_html=True)
+        rows_html = ""
+        for _, row in df.iterrows():
+            badge_cls = "etf" if row["Type"] == "ETF" else ""
+            dd    = row["Max Drawdown %"]
+            vol_v = row["Volatility %"]
+            dd_html  = f'<span class="neg">{dd}%</span>' if pd.notna(dd) else "—"
+            vol_html = f'{vol_v}%' if pd.notna(vol_v) else "—"
+            rows_html += f"""<tr>
+                <td class="tk">{row['Ticker']}</td>
+                <td><span class="badge {badge_cls}">{row['Type']}</span></td>
+                <td class="r">${row['Amount Invested']:,.0f}</td>
+                <td class="r">{row['Allocation %']}%</td>
+                <td>{row['Sector']}</td>
+                <td class="r">{row['Beta']}</td>
+                <td class="r">{vol_html}</td>
+                <td class="r">{dd_html}</td>
+            </tr>"""
+        st.markdown(f'<table class="h-table"><thead><tr><th>Ticker</th><th>Type</th><th class="r">Amount</th><th class="r">Alloc</th><th>Sector</th><th class="r">Beta</th><th class="r">Vol</th><th class="r">Max DD</th></tr></thead><tbody>{rows_html}</tbody></table>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown('<div class="pit-surface">', unsafe_allow_html=True)
+        st.markdown('<div class="pit-label">Sector Exposure</div>', unsafe_allow_html=True)
+        sector_rows = ""
+        for sector, pct in sorted(s["sector_breakdown"].items(), key=lambda x: x[1], reverse=True):
+            sector_rows += f'<tr><td>{sector}</td><td class="r">{pct}%</td><td><div class="s-bar-bg"><div class="s-bar-fill" style="width:{min(pct,100)}%"></div></div></td></tr>'
+        st.markdown(f'<table class="s-table"><thead><tr><th>Sector</th><th class="r">Allocation</th><th></th></tr></thead><tbody>{sector_rows}</tbody></table>', unsafe_allow_html=True)
+        for sec, pct in s["concentrated_sectors"].items():
+            st.markdown(f'<div class="pit-alert">{pct}% in {sec} — significant concentration risk</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # ============================================================
+    # TAB: BENCHMARK
+    # ============================================================
+    elif active == "benchmark":
+        spy = s.get("spy_data")
+        if spy:
+            st.markdown('<div class="pit-surface">', unsafe_allow_html=True)
+            st.markdown('<div class="pit-label">Portfolio vs. SPY</div>', unsafe_allow_html=True)
+            p_ret     = s.get("portfolio_return")
+            p_sharpe  = s.get("sharpe_ratio")
+            spy_sharpe= s.get("spy_sharpe")
+            rfr       = s.get("risk_free_rate", RISK_FREE_RATE_FALLBACK)
+            p_ret_str = (("+" if p_ret >= 0 else "") + str(p_ret) + "%") if p_ret is not None else "N/A"
+            p_ret_cls = "pos" if (p_ret is not None and p_ret >= 0) else "neg"
+            s_ret_cls = "pos" if spy["one_year_return"] >= 0 else "neg"
+            s_ret_str = ("+" if spy["one_year_return"] >= 0 else "") + str(spy["one_year_return"]) + "%"
+            p_sh_cls  = "pos" if (p_sharpe is not None and p_sharpe >= 1.0) else "neg"
+            s_sh_cls  = "pos" if (spy_sharpe is not None and spy_sharpe >= 1.0) else "neg"
+            st.markdown(f"""<table class="b-table">
+                <thead><tr><th>Metric</th><th>Your Portfolio</th><th>SPY</th></tr></thead>
+                <tbody>
+                <tr><td class="row-label">Beta</td><td>{s['weighted_beta']}</td><td>1.00</td></tr>
+                <tr><td class="row-label">Annualized Volatility</td><td>{vol_str}</td><td>{spy['volatility']}%</td></tr>
+                <tr><td class="row-label">1-Year Return</td><td class="{p_ret_cls}">{p_ret_str}</td><td class="{s_ret_cls}">{s_ret_str}</td></tr>
+                <tr><td class="row-label">Sharpe Ratio</td><td class="{p_sh_cls}">{str(p_sharpe) if p_sharpe is not None else 'N/A'}</td><td class="{s_sh_cls}">{str(spy_sharpe) if spy_sharpe is not None else 'N/A'}</td></tr>
+                <tr><td class="row-label">Max Drawdown</td><td class="neg">{dd_str}</td><td>—</td></tr>
+                </tbody></table>
+                <div class="pit-caption">Beta: market sensitivity — SPY=1.00 by definition &nbsp;·&nbsp; Sharpe=(Return−RFR)/Vol &nbsp;·&nbsp; Risk-free rate: {rfr}% &nbsp;·&nbsp; Sharpe ≥1.0 good · ≥2.0 strong</div>""",
+                unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="pit-empty"><div class="pit-empty-icon">◎</div>SPY benchmark data unavailable.</div>', unsafe_allow_html=True)
+
+    # ============================================================
+    # TAB: CORRELATION
+    # ============================================================
+    elif active == "correlation":
+        corr_matrix    = s.get("corr_matrix")
+        high_corr_pairs = s.get("high_corr_pairs", [])
+        if corr_matrix is not None:
+            st.markdown('<div class="pit-surface">', unsafe_allow_html=True)
+            st.markdown('<div class="pit-label">Holdings Correlation</div>', unsafe_allow_html=True)
+            tickers_c    = corr_matrix.columns.tolist()
+            header_cells = "<th></th>" + "".join(f"<th>{t}</th>" for t in tickers_c)
+            rows_html    = ""
+            for rt in tickers_c:
+                cells = f"<td>{rt}</td>"
+                for ct in tickers_c:
+                    val   = corr_matrix.loc[rt, ct]
+                    style = corr_cell_style(val)
+                    cells += f'<td style="{style}">{val}</td>'
+                rows_html += f"<tr>{cells}</tr>"
+            st.markdown(f'<table class="c-table"><thead><tr>{header_cells}</tr></thead><tbody>{rows_html}</tbody></table><div class="pit-caption">1.0=lockstep &nbsp;·&nbsp; 0.0=no relation &nbsp;·&nbsp; Negative(blue)=good diversifier &nbsp;·&nbsp; Red≥0.80=hidden concentration</div>', unsafe_allow_html=True)
+            for pair in high_corr_pairs:
+                st.markdown(f'<div class="pit-warn">{pair["pair"]} — correlation {pair["correlation"]}. These holdings move together.</div>', unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="pit-empty"><div class="pit-empty-icon">◎</div>Need at least 2 holdings to calculate correlation.</div>', unsafe_allow_html=True)
+
+    # ============================================================
+    # TAB: HOLDINGS
+    # ============================================================
+    elif active == "holdings":
+        st.markdown('<div class="pit-surface">', unsafe_allow_html=True)
+        st.markdown('<div class="pit-label">Full Holdings Detail</div>', unsafe_allow_html=True)
+        rows_html = ""
+        for _, row in df.iterrows():
+            badge_cls = "etf" if row["Type"] == "ETF" else ""
+            dd    = row["Max Drawdown %"]
+            vol_v = row["Volatility %"]
+            dd_html  = f'<span class="neg">{dd}%</span>' if pd.notna(dd) else "—"
+            vol_html = f'{vol_v}%' if pd.notna(vol_v) else "—"
+            rows_html += f"""<tr>
+                <td class="tk">{row['Ticker']}</td><td><span class="badge {badge_cls}">{row['Type']}</span></td>
+                <td class="r">${row['Amount Invested']:,.0f}</td><td class="r">{row['Allocation %']}%</td>
+                <td>{row['Sector']}</td><td class="r">{row['Beta']}</td>
+                <td class="r">{vol_html}</td><td class="r">{dd_html}</td></tr>"""
+        st.markdown(f'<table class="h-table"><thead><tr><th>Ticker</th><th>Type</th><th class="r">Amount</th><th class="r">Alloc</th><th>Sector</th><th class="r">Beta</th><th class="r">Vol</th><th class="r">Max DD</th></tr></thead><tbody>{rows_html}</tbody></table>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # ============================================================
+    # TAB: SECTORS
+    # ============================================================
+    elif active == "sectors":
+        st.markdown('<div class="pit-surface">', unsafe_allow_html=True)
+        st.markdown('<div class="pit-label">Sector Breakdown</div>', unsafe_allow_html=True)
+        sector_rows = ""
+        for sector, pct in sorted(s["sector_breakdown"].items(), key=lambda x: x[1], reverse=True):
+            sector_rows += f'<tr><td>{sector}</td><td class="r">{pct}%</td><td><div class="s-bar-bg"><div class="s-bar-fill" style="width:{min(pct,100)}%"></div></div></td></tr>'
+        st.markdown(f'<table class="s-table"><thead><tr><th>Sector</th><th class="r">Allocation</th><th></th></tr></thead><tbody>{sector_rows}</tbody></table>', unsafe_allow_html=True)
+        for sec, pct in s["concentrated_sectors"].items():
+            st.markdown(f'<div class="pit-alert">{pct}% in {sec}</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # ============================================================
+    # TAB: AI ANALYSIS + FOLLOW-UP Q&A
+    # ============================================================
+    elif active == "analysis":
+        st.markdown('<div class="pit-surface">', unsafe_allow_html=True)
+        st.markdown('<div class="pit-label">Analysis</div>', unsafe_allow_html=True)
+        if st.session_state.ai_failed:
+            st.markdown(f'<div class="pit-warn">{st.session_state.ai_analysis}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="ai-text">{st.session_state.ai_analysis}</div>', unsafe_allow_html=True)
+
+        if st.session_state.qa_history:
+            st.markdown('<hr class="qa-divider">', unsafe_allow_html=True)
+            st.markdown('<div class="pit-label">Follow-up Questions</div>', unsafe_allow_html=True)
+            for qa in st.session_state.qa_history:
+                st.markdown(f'<div class="qa-question">{qa["question"]}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="qa-answer">{qa["answer"]}</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown('<div class="pit-surface">', unsafe_allow_html=True)
+        st.markdown('<div class="pit-label">Ask a Question</div>', unsafe_allow_html=True)
+        st.markdown('<p class="pit-input-hint">Ask anything about your portfolio — specific holdings, risk, what-ifs.</p>', unsafe_allow_html=True)
+        with st.form(key="qa_form", clear_on_submit=True):
+            user_q = st.text_input("Question", placeholder="e.g. Why is my Sharpe ratio low? What happens if I sell TSLA?", label_visibility="collapsed")
+            if st.form_submit_button("Ask") and user_q.strip():
+                with st.spinner("Thinking…"):
+                    answer = answer_question(user_q.strip())
+                st.session_state.qa_history.append({"question": user_q.strip(), "answer": answer})
+                st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # ---- Data notes ----
+    if s.get("warnings") or s.get("skipped") or s.get("missing_data_notes"):
+        with st.expander("Data notes"):
+            for w in s.get("warnings", []):
+                st.markdown(f'<div class="pit-warn">{w}</div>', unsafe_allow_html=True)
+            for sk in s.get("skipped", []):
+                st.markdown(f'<div class="pit-warn">Skipped: {sk}</div>', unsafe_allow_html=True)
+            for note in s.get("missing_data_notes", []):
+                st.caption("— " + note)
